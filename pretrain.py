@@ -373,8 +373,11 @@ class DualModeModel(nn.Module):
         """
         batch_size, seq_len = input_ids.shape
         
-        # Embeddings
+        # Embeddings - use modulo to wrap position_ids if seq_len > position embedding size
         position_ids = torch.arange(seq_len, device=input_ids.device).unsqueeze(0).expand(batch_size, -1)
+        # Wrap position IDs using modulo for sequences longer than embedding size
+        if hasattr(self, 'max_seq_len') and self.position_embeddings.num_embeddings < seq_len:
+            position_ids = position_ids % self.position_embeddings.num_embeddings
         hidden_states = self.token_embeddings(input_ids) + self.position_embeddings(position_ids)
         hidden_states = self.embed_layernorm(hidden_states)
         
