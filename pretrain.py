@@ -967,7 +967,7 @@ def main():
     
     # Enable gradient checkpointing
     if config.use_gradient_checkpointing:
-        model.gradient_checkpointing_enable()
+        model.enable_gradient_checkpointing()
     
     # Create datasets
     print("\n=== Loading Dataset ===")
