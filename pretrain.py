@@ -382,11 +382,10 @@ class DualModeModel(nn.Module):
         """
         batch_size, seq_len = input_ids.shape
         
-        # Embeddings - use modulo to wrap position_ids if seq_len > position embedding size
+        # Embeddings - always wrap position_ids with modulo to handle any seq_len
         position_ids = torch.arange(seq_len, device=input_ids.device).unsqueeze(0).expand(batch_size, -1)
-        # Wrap position IDs using modulo for sequences longer than embedding size
-        if hasattr(self, 'max_seq_len') and self.position_embeddings.num_embeddings < seq_len:
-            position_ids = position_ids % self.position_embeddings.num_embeddings
+        # Wrap position IDs using modulo (position embeddings are smaller than seq_len)
+        position_ids = position_ids % self.position_embeddings.num_embeddings
         hidden_states = self.token_embeddings(input_ids) + self.position_embeddings(position_ids)
         hidden_states = self.embed_layernorm(hidden_states)
         
@@ -605,13 +604,12 @@ class UltraFineWebDataset(Dataset):
         
         # Load dataset - preload a subset for efficiency
         try:
-            # Load a small subset first to avoid memory issues
+            # Load dataset without split_by (deprecated in newer datasets versions)
             self.dataset = load_dataset(
                 "openbmb/Ultra-FineWeb",
                 split=split,
-                streaming=False,  # Use non-streaming for easier handling
-                trust_remote_code=True,
-                split_by="document",
+                streaming=False,
+                trust_remote_code=False,  # Newer versions don't need this
             )
             # Take a subset
             self.dataset = self.dataset.select(range(min(max_samples, len(self.dataset))))
