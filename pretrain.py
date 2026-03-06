@@ -554,22 +554,24 @@ class UltraFineWebDataset(Dataset):
     
     def __init__(
         self,
-        split: str = "train",
+        split: str = "en",
         seq_len: int = 512,
         tokenizer=None,
-        max_samples: Optional[int] = None,
+        max_samples: Optional[int] = 100000,
     ):
         """
         Load Ultra-FineWeb dataset.
         
         Args:
-            split: "train" or "test"
+            split: "en" or "zh"
             seq_len: Sequence length
             tokenizer: Tokenizer to use
-            max_samples: Maximum number of samples to load (None = all)
+            max_samples: Maximum number of samples to cache
         """
         self.seq_len = seq_len
         self.tokenizer = tokenizer
+        self._max_samples = max_samples
+        self._dummy_mode = False
         
         # Try to import datasets
         try:
@@ -579,79 +581,61 @@ class UltraFineWebDataset(Dataset):
         
         print(f"Loading Ultra-FineWeb dataset ({split} split)...")
         
-        # Load dataset - use streaming to handle large dataset
+        # Load dataset - preload a subset for efficiency
         try:
+            # Load a small subset first to avoid memory issues
             self.dataset = load_dataset(
                 "openbmb/Ultra-FineWeb",
                 split=split,
-                streaming=True,
+                streaming=False,  # Use non-streaming for easier handling
                 trust_remote_code=True,
+                split_by="document",
             )
+            # Take a subset
+            self.dataset = self.dataset.select(range(min(max_samples, len(self.dataset))))
+            print(f"Loaded {len(self.dataset)} samples")
         except Exception as e:
             print(f"Failed to load Ultra-FineWeb: {e}")
-            print("Falling back to dummy data.")
-            self.dataset = None
+            print("Using dummy data.")
             self._dummy_mode = True
+            self._data = []
             return
         
-        self._dummy_mode = False
-        self._iterator = iter(self.dataset)
-        
-        # Cache for efficiency
-        self._cache = []
-        self._cache_size = 10000
-        self._cache_idx = 0
-        
-        # Count samples if max_samples is specified
-        if max_samples:
-            self._max_samples = max_samples
-        else:
-            self._max_samples = float('inf')
-        
-        self._num_loaded = 0
+        # Convert to list for random access
+        self._data = list(self.dataset)
     
     def __len__(self) -> int:
         if self._dummy_mode:
             return 1000
-        # Ultra-FineWeb has ~100M+ samples, limit for practical use
-        return min(self._max_samples, 1000000)  # Cap at 1M samples
+        return len(self._data)
     
     def __getitem__(self, idx: int) -> torch.Tensor:
-        if self._dummy_mode:
+        if self._dummy_mode or idx >= len(self._data):
+            # Return random tokens for dummy mode or out of bounds
             return torch.randint(0, 32000, (self.seq_len,), dtype=torch.long)
         
-        # Simple approach: load and tokenize on demand
-        if self._num_loaded < self._max_samples:
-            try:
-                item = next(self._iterator)
-                # Ultra-FineWeb has "content" column
-                text = item.get("content", item.get("text", ""))
-                
-                if not text:
-                    # Skip empty texts
-                    return self.__getitem__(idx)
-                
-                # Tokenize
-                tokens = self.tokenizer.encode(
-                    text,
-                    max_length=self.seq_len,
-                    truncation=True,
-                    padding="max_length",
-                    return_tensors="pt",
-                )
-                
-                self._num_loaded += 1
-                return tokens.squeeze(0)
-                
-            except StopIteration:
-                # Restart iterator
-                self._iterator = iter(self.dataset)
-                return self.__getitem__(idx)
-            except Exception as e:
-                # Skip problematic items
-                return self.__getitem__(idx)
-        else:
-            # Return cached or generate
+        try:
+            item = self._data[idx]
+            # Ultra-FineWeb has "content" column
+            text = item.get("content", item.get("text", ""))
+            
+            if not text:
+                # Return random tokens for empty text
+                return torch.randint(0, 32000, (self.seq_len,), dtype=torch.long)
+            
+            # Tokenize
+            tokens = self.tokenizer.encode(
+                text,
+                max_length=self.seq_len,
+                truncation=True,
+                padding="max_length",
+                return_tensors="pt",
+            )
+            
+            return tokens.squeeze(0)
+            
+        except Exception as e:
+            # Skip problematic items
             return torch.randint(0, 32000, (self.seq_len,), dtype=torch.long)
 
 
@@ -660,7 +644,7 @@ def get_default_tokenizer():
     try:
         from transformers import AutoTokenizer
         # Use a small, efficient tokenizer
-        return AutoTokenizer.from_pretrained(
+        tokenizer = AutoTokenizer.from_pretrained(
             "meta-llama/Llama-3.2-1B",
             trust_remote_code=True,
             use_fast=False,
@@ -669,7 +653,14 @@ def get_default_tokenizer():
         print(f"Warning: Could not load Llama tokenizer: {e}")
         print("Using GPT-2 tokenizer as fallback...")
         from transformers import GPT2Tokenizer
-        return GPT2Tokenizer.from_pretrained("gpt2")
+        model_name = "gpt2"  # public tokenizer
+        tokenizer = GPT2Tokenizer.from_pretrained(model_name)
+    
+    # Ensure padding token is set
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+    
+    return tokenizer
 
 
 # ============================================================================
