@@ -957,7 +957,7 @@ def main():
         mlp_ratio=config.mlp_ratio,
         max_seq_len=config.max_seq_len,
         use_flash_attn=config.use_flash_attention,
-        gradient_checkpointing=config.gradient_checkpointing,
+        gradient_checkpointing=config.use_gradient_checkpointing,
     )
     
     num_params = model.get_num_params()
