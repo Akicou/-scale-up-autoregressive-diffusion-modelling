@@ -1,0 +1,15 @@
+{
+  "description": "Scale 10M model to 4B parameters",
+  "input": "./checkpoints/10m_pretrain",
+  "output": "./checkpoints/4b_scaled",
+  "target_parameters": 4000000000,
+  "method": "width+depth",
+  "interpolate_pos_embeddings": "linear",
+  "config": {
+    "target": {
+      "hidden_size": 3072,
+      "num_layers": 32,
+      "num_heads": 24
+    }
+  }
+}

@@ -1,0 +1,35 @@
+{
+  "model_path": "./checkpoints/4b_sft",
+  "output_dir": "./checkpoints/4b_dpo",
+  "train_data_path": "./data/preference.json",
+  "eval_data_path": null,
+  "epochs": 3,
+  "batch_size": 4,
+  "learning_rate": 1e-5,
+  "warmup_steps": 50,
+  "gradient_accumulation_steps": 1,
+  "max_seq_length": 512,
+  "max_grad_norm": 1.0,
+  "finetuning": {
+    "method": "lora",
+    "lora_r": 16,
+    "lora_alpha": 32,
+    "lora_dropout": 0.05,
+    "lora_target_modules": ["q_proj", "v_proj", "k_proj", "o_proj"]
+  },
+  "dpo": {
+    "beta": 0.1,
+    "loss_type": "sigmoid",
+    "reference_free": false
+  },
+  "optimization": {
+    "use_gradient_checkpointing": true,
+    "mixed_precision": "bf16"
+  },
+  "logging": {
+    "wandb_project": "dual-mode-dpo",
+    "log_interval": 10,
+    "eval_interval": 500,
+    "save_interval": 1000
+  }
+}

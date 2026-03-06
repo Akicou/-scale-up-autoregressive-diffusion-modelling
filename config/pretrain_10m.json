@@ -1,0 +1,33 @@
+{
+  "model_name": "DualMode-10M",
+  "data_path": "./data/train.bin",
+  "val_data_path": "./data/val.bin",
+  "output_dir": "./checkpoints/10m_pretrain",
+  "epochs": 3,
+  "batch_size": 64,
+  "lr": 1e-4,
+  "warmup_steps": 100,
+  "save_interval": 1000,
+  "log_interval": 10,
+  "eval_interval": 1000,
+  "max_seq_len": 512,
+  "model": {
+    "vocab_size": 32000,
+    "hidden_size": 512,
+    "num_layers": 10,
+    "num_heads": 8,
+    "head_dim": 64,
+    "mlp_ratio": 4.0
+  },
+  "training": {
+    "use_gradient_checkpointing": true,
+    "mixed_precision": "bf16",
+    "accumulation_steps": 1,
+    "loss_mode": "both",
+    "ar_loss_weight": 1.0,
+    "diffusion_loss_weight": 1.0
+  },
+  "logging": {
+    "wandb_project": "dual-mode-pretrain"
+  }
+}
