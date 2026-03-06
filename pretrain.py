@@ -21,6 +21,7 @@ Usage:
 """
 
 import argparse
+import itertools
 import json
 import math
 import os
@@ -602,27 +603,24 @@ class UltraFineWebDataset(Dataset):
         
         print(f"Loading Ultra-FineWeb dataset ({split} split)...")
         
-        # Load dataset - preload a subset for efficiency
+        # Load dataset - use streaming to only download what's needed
         try:
-            # Load dataset without split_by (deprecated in newer datasets versions)
+            # Use streaming mode to avoid downloading entire dataset
             self.dataset = load_dataset(
                 "openbmb/Ultra-FineWeb",
                 split=split,
-                streaming=False,
-                trust_remote_code=False,  # Newer versions don't need this
+                streaming=True,
+                trust_remote_code=False,
             )
-            # Take a subset
-            self.dataset = self.dataset.select(range(min(max_samples, len(self.dataset))))
-            print(f"Loaded {len(self.dataset)} samples")
+            # Take only the first max_samples (streams and stops downloading)
+            self._data = list(itertools.islice(self.dataset, max_samples))
+            print(f"Loaded {len(self._data)} samples (streaming)")
         except Exception as e:
             print(f"Failed to load Ultra-FineWeb: {e}")
             print("Using dummy data.")
             self._dummy_mode = True
             self._data = []
             return
-        
-        # Convert to list for random access
-        self._data = list(self.dataset)
     
     def __len__(self) -> int:
         if self._dummy_mode:
