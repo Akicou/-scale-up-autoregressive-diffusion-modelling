@@ -401,7 +401,27 @@ class SFTTrainer(BaseFinetuner):
                 mtp_loss_weights=model_cfg.get("mtp_loss_weights", [1.0, 0.7, 0.5]),
             )
             state_dict = torch.load(Path(self.config.model_path) / "model.pt", map_location="cpu")
-            base_model.load_state_dict(state_dict)
+
+            # Load what matches exactly, then overlap-copy mismatched tensors (for older scaled checkpoints)
+            model_state = base_model.state_dict()
+            exact_state = {}
+            mismatched = []
+            for k, v in state_dict.items():
+                if k not in model_state:
+                    continue
+                if model_state[k].shape == v.shape:
+                    exact_state[k] = v
+                else:
+                    mismatched.append((k, v, model_state[k]))
+
+            base_model.load_state_dict(exact_state, strict=False)
+
+            for k, src, dst_template in mismatched:
+                patched = dst_template.clone()
+                slices = tuple(slice(0, min(ds, ss)) for ds, ss in zip(dst_template.shape, src.shape))
+                patched[slices] = src[slices]
+                base_model.load_state_dict({k: patched}, strict=False)
+
             model = CustomDualModeAdapterModel(base_model)
             model._is_custom_dualmode = True
             return model
