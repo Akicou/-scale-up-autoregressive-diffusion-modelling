@@ -108,6 +108,33 @@ def calculate_target_config(
     }
 
 
+def expand_embedding_dim(
+    old_embed: nn.Embedding,
+    new_embedding_dim: int,
+) -> nn.Embedding:
+    """
+    Expand embedding layer's embedding dimension (hidden size).
+    
+    Args:
+        old_embed: Old embedding layer
+        new_embedding_dim: New embedding dimension
+    
+    Returns:
+        New embedding layer with expanded dimension
+    """
+    old_num_embeddings, old_embedding_dim = old_embed.weight.shape
+    new_embed = nn.Embedding(old_num_embeddings, new_embedding_dim)
+    
+    with torch.no_grad():
+        # Copy existing embeddings
+        new_embed.weight.data[:, :old_embedding_dim] = old_embed.weight.data
+        # Initialize new dimensions with small random values
+        if new_embedding_dim > old_embedding_dim:
+            torch.nn.init.normal_(new_embed.weight.data[:, old_embedding_dim:], mean=0.0, std=0.02)
+    
+    return new_embed
+
+
 def interpolate_position_embeddings(
     old_embed: nn.Embedding,
     new_seq_len: int,
@@ -229,10 +256,10 @@ def scale_model_width(
     )
     
     with torch.no_grad():
-        # Scale token embeddings
-        new_model.token_embeddings = expand_linear_layer(
+        # Scale token embeddings (expand embedding dimension for width scaling)
+        new_model.token_embeddings = expand_embedding_dim(
             model.token_embeddings,
-            new_out_features=new_config["hidden_size"],
+            new_embedding_dim=new_config["hidden_size"],
         )
         
         # Scale position embeddings (interpolate if needed)
