@@ -242,6 +242,7 @@ def scale_model_width(
         "num_layers": model.num_layers,
         "num_heads": model.num_heads,
         "head_dim": model.head_dim,
+        "mlp_ratio": model.mlp_ratio if hasattr(model, 'mlp_ratio') else 4.0,
     }
     
     # Create new model
