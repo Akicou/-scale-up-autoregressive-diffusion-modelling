@@ -57,9 +57,11 @@ except ImportError:
 # Try to import Accelerate
 try:
     from accelerate import Accelerator
+    from accelerate.utils import DistributedDataParallelKwargs
     HAS_ACCELERATE = True
 except ImportError:
     Accelerator = None
+    DistributedDataParallelKwargs = None
     HAS_ACCELERATE = False
 
 # Try to import Flash Attention 2
@@ -1127,7 +1129,11 @@ def main():
     if args.use_accelerate:
         if not HAS_ACCELERATE:
             raise ImportError("accelerate is not installed. Install it via: pip install accelerate")
-        accelerator = Accelerator(mixed_precision=config.mixed_precision if config.mixed_precision != "fp32" else "no")
+        ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
+        accelerator = Accelerator(
+            mixed_precision=config.mixed_precision if config.mixed_precision != "fp32" else "no",
+            kwargs_handlers=[ddp_kwargs],
+        )
         device = accelerator.device
         config.device = str(device)
     else:
