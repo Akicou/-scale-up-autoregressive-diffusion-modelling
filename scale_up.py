@@ -390,21 +390,28 @@ def scale_model_depth(
             
             # Copy attention weights
             new_layer.attention.q_proj.weight.data = old_layer.attention.q_proj.weight.data.clone()
-            new_layer.attention.q_proj.bias.data = old_layer.attention.q_proj.bias.data.clone()
+            if old_layer.attention.q_proj.bias is not None:
+                new_layer.attention.q_proj.bias.data = old_layer.attention.q_proj.bias.data.clone()
             new_layer.attention.k_proj.weight.data = old_layer.attention.k_proj.weight.data.clone()
-            new_layer.attention.k_proj.bias.data = old_layer.attention.k_proj.bias.data.clone()
+            if old_layer.attention.k_proj.bias is not None:
+                new_layer.attention.k_proj.bias.data = old_layer.attention.k_proj.bias.data.clone()
             new_layer.attention.v_proj.weight.data = old_layer.attention.v_proj.weight.data.clone()
-            new_layer.attention.v_proj.bias.data = old_layer.attention.v_proj.bias.data.clone()
+            if old_layer.attention.v_proj.bias is not None:
+                new_layer.attention.v_proj.bias.data = old_layer.attention.v_proj.bias.data.clone()
             new_layer.attention.o_proj.weight.data = old_layer.attention.o_proj.weight.data.clone()
-            new_layer.attention.o_proj.bias.data = old_layer.attention.o_proj.bias.data.clone()
+            if old_layer.attention.o_proj.bias is not None:
+                new_layer.attention.o_proj.bias.data = old_layer.attention.o_proj.bias.data.clone()
             
             # Copy MLP weights
             new_layer.mlp.gate_proj.weight.data = old_layer.mlp.gate_proj.weight.data.clone()
-            new_layer.mlp.gate_proj.bias.data = old_layer.mlp.gate_proj.bias.data.clone()
+            if old_layer.mlp.gate_proj.bias is not None:
+                new_layer.mlp.gate_proj.bias.data = old_layer.mlp.gate_proj.bias.data.clone()
             new_layer.mlp.up_proj.weight.data = old_layer.mlp.up_proj.weight.data.clone()
-            new_layer.mlp.up_proj.bias.data = old_layer.mlp.up_proj.bias.data.clone()
+            if old_layer.mlp.up_proj.bias is not None:
+                new_layer.mlp.up_proj.bias.data = old_layer.mlp.up_proj.bias.data.clone()
             new_layer.mlp.down_proj.weight.data = old_layer.mlp.down_proj.weight.data.clone()
-            new_layer.mlp.down_proj.bias.data = old_layer.mlp.down_proj.bias.data.clone()
+            if old_layer.mlp.down_proj.bias is not None:
+                new_layer.mlp.down_proj.bias.data = old_layer.mlp.down_proj.bias.data.clone()
             
             # Copy layer norms
             new_layer.input_layernorm.weight.data = old_layer.input_layernorm.weight.data.clone()
