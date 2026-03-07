@@ -94,6 +94,13 @@ class TrainerConfig:
     train_data_path: Optional[str] = None
     eval_data_path: Optional[str] = None
 
+    # Hugging Face dataset options
+    hf_dataset_name: Optional[str] = None
+    hf_train_split: str = "train"
+    hf_eval_split: Optional[str] = None
+    hf_conversation_column: str = "conversation_a"
+    hf_max_samples: Optional[int] = None
+
 
 class BaseFinetuner(ABC):
     """
@@ -397,6 +404,13 @@ class BaseFinetuner(ABC):
         # Data
         parser.add_argument("--train-data-path", type=str, default=None)
         parser.add_argument("--eval-data-path", type=str, default=None)
+
+        # Hugging Face dataset options
+        parser.add_argument("--hf-dataset-name", type=str, default=None, help="HF dataset name, e.g. lmsys/chatbot_arena_conversations")
+        parser.add_argument("--hf-train-split", type=str, default="train", help="HF train split name")
+        parser.add_argument("--hf-eval-split", type=str, default=None, help="HF eval split name")
+        parser.add_argument("--hf-conversation-column", type=str, default="conversation_a", help="Column containing ShareGPT-style conversation list")
+        parser.add_argument("--hf-max-samples", type=int, default=None, help="Optional max samples to load from HF splits")
         
         return parser
 

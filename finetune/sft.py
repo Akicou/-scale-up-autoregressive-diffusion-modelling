@@ -16,6 +16,12 @@ import os
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
 
+try:
+    from datasets import load_dataset
+    HAS_DATASETS = True
+except ImportError:
+    HAS_DATASETS = False
+
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, Dataset
@@ -136,6 +142,77 @@ class InstructionDataset(Dataset):
             # Default: train on everything
             labels = input_ids.clone()
         
+        return {
+            "input_ids": input_ids,
+            "attention_mask": attention_mask,
+            "labels": labels,
+        }
+
+
+class HFDatasetSFT(Dataset):
+    """Dataset for HF ShareGPT-style conversations in a single column."""
+
+    def __init__(
+        self,
+        dataset_name: str,
+        split: str,
+        conversation_column: str,
+        tokenizer: PreTrainedTokenizer,
+        max_seq_length: int = 512,
+        max_samples: Optional[int] = None,
+    ):
+        if not HAS_DATASETS:
+            raise ImportError("datasets package is required for --hf-dataset-name")
+
+        self.tokenizer = tokenizer
+        self.max_seq_length = max_seq_length
+        self.conversation_column = conversation_column
+
+        ds = load_dataset(dataset_name, split=split)
+        if max_samples is not None:
+            ds = ds.select(range(min(max_samples, len(ds))))
+        self.data = ds
+
+    def __len__(self) -> int:
+        return len(self.data)
+
+    @staticmethod
+    def _normalize_role(role: str) -> str:
+        role = (role or "user").strip().lower()
+        if role in ("assistant", "model", "bot"):
+            return "assistant"
+        return "user"
+
+    def _format_conversation(self, convo: List[Dict[str, Any]]) -> str:
+        parts: List[str] = []
+        for msg in convo:
+            role = self._normalize_role(msg.get("role", "user"))
+            content = str(msg.get("content", ""))
+            parts.append(f"<|im_start|>{role}\n{content}<|im_end|>")
+        return "\n".join(parts)
+
+    def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
+        row = self.data[idx]
+        convo = row.get(self.conversation_column, [])
+        if not isinstance(convo, list):
+            convo = []
+
+        text = self._format_conversation(convo)
+        if not text:
+            text = "<|im_start|>user\nHello<|im_end|>\n<|im_start|>assistant\nHi!<|im_end|>"
+
+        encoding = self.tokenizer(
+            text,
+            max_length=self.max_seq_length,
+            truncation=True,
+            padding="max_length",
+            return_tensors="pt",
+        )
+
+        input_ids = encoding["input_ids"].squeeze()
+        attention_mask = encoding["attention_mask"].squeeze()
+        labels = input_ids.clone()
+
         return {
             "input_ids": input_ids,
             "attention_mask": attention_mask,
@@ -284,27 +361,52 @@ class SFTTrainer(BaseFinetuner):
     
     def setup_data(self) -> tuple:
         """Setup training and evaluation data."""
-        # Create datasets
-        train_dataset = InstructionDataset(
-            data_path=self.config.train_data_path,
-            tokenizer=self.tokenizer,
-            max_seq_length=self.config.max_seq_length,
-        )
-        
-        eval_dataset = None
-        if self.config.eval_data_path:
-            eval_dataset = InstructionDataset(
-                data_path=self.config.eval_data_path,
+        if self.config.hf_dataset_name:
+            train_dataset = HFDatasetSFT(
+                dataset_name=self.config.hf_dataset_name,
+                split=self.config.hf_train_split,
+                conversation_column=self.config.hf_conversation_column,
                 tokenizer=self.tokenizer,
                 max_seq_length=self.config.max_seq_length,
+                max_samples=self.config.hf_max_samples,
             )
+
+            if self.config.hf_eval_split:
+                eval_dataset = HFDatasetSFT(
+                    dataset_name=self.config.hf_dataset_name,
+                    split=self.config.hf_eval_split,
+                    conversation_column=self.config.hf_conversation_column,
+                    tokenizer=self.tokenizer,
+                    max_seq_length=self.config.max_seq_length,
+                    max_samples=self.config.hf_max_samples,
+                )
+            else:
+                eval_dataset = InstructionDataset(
+                    data_path=None,
+                    tokenizer=self.tokenizer,
+                    max_seq_length=self.config.max_seq_length,
+                )
         else:
-            # Use a subset for eval
-            eval_dataset = InstructionDataset(
-                data_path=None,
+            # Create datasets from local files
+            train_dataset = InstructionDataset(
+                data_path=self.config.train_data_path,
                 tokenizer=self.tokenizer,
                 max_seq_length=self.config.max_seq_length,
             )
+
+            if self.config.eval_data_path:
+                eval_dataset = InstructionDataset(
+                    data_path=self.config.eval_data_path,
+                    tokenizer=self.tokenizer,
+                    max_seq_length=self.config.max_seq_length,
+                )
+            else:
+                # Use a subset for eval
+                eval_dataset = InstructionDataset(
+                    data_path=None,
+                    tokenizer=self.tokenizer,
+                    max_seq_length=self.config.max_seq_length,
+                )
         
         # Data collator
         data_collator = DataCollatorForLanguageModeling(
@@ -409,6 +511,11 @@ def main():
         wandb_project=args.wandb_project,
         train_data_path=args.train_data_path,
         eval_data_path=args.eval_data_path,
+        hf_dataset_name=args.hf_dataset_name,
+        hf_train_split=args.hf_train_split,
+        hf_eval_split=args.hf_eval_split,
+        hf_conversation_column=args.hf_conversation_column,
+        hf_max_samples=args.hf_max_samples,
     )
     
     # Create trainer
