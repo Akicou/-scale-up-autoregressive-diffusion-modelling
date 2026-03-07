@@ -1199,20 +1199,6 @@ def main():
     
     model = model.to(device)
     
-    # Resize token embeddings if tokenizer has more tokens (due to special tokens)
-    if tokenizer is not None and hasattr(tokenizer, 'vocab_size') and tokenizer.vocab_size > model.vocab_size:
-        print(f"Resizing token embeddings from {model.vocab_size} to {len(tokenizer)}")
-        model.vocab_size = len(tokenizer)
-        old_embeddings = model.token_embeddings
-        model.token_embeddings = nn.Embedding(len(tokenizer), model.hidden_size).to(device)
-        # Copy old embeddings
-        with torch.no_grad():
-            model.token_embeddings.weight[:old_embeddings.num_embeddings] = old_embeddings.weight
-        # Initialize new embeddings
-        torch.nn.init.normal_(model.token_embeddings.weight[old_embeddings.num_embeddings:], mean=0.0, std=0.02)
-        num_params = model.get_num_params()
-        print(f"Updated parameters: {num_params:,} ({num_params / 1e6:.1f}M)")
-    
     # Enable gradient checkpointing
     if config.use_gradient_checkpointing:
         model.enable_gradient_checkpointing()
@@ -1239,6 +1225,26 @@ def main():
     else:
         # Binary token file
         train_dataset = BinaryDataset(config.data_path, config.max_seq_len, max_samples=config.max_samples)
+
+    # If tokenizer-based training is used, align model vocab to tokenizer length BEFORE training
+    if tokenizer is not None:
+        tokenizer_size = len(tokenizer)
+        if tokenizer_size != model.vocab_size:
+            print(f"Aligning model vocab to tokenizer: model={model.vocab_size}, tokenizer={tokenizer_size}")
+            old_embeddings = model.token_embeddings
+            new_embeddings = nn.Embedding(tokenizer_size, model.hidden_size).to(device)
+            copy_n = min(old_embeddings.num_embeddings, tokenizer_size)
+            with torch.no_grad():
+                new_embeddings.weight[:copy_n] = old_embeddings.weight[:copy_n]
+                if tokenizer_size > copy_n:
+                    torch.nn.init.normal_(new_embeddings.weight[copy_n:], mean=0.0, std=0.02)
+            model.token_embeddings = new_embeddings
+            model.vocab_size = tokenizer_size
+            # Keep mask token as last token id in aligned vocab
+            model.mask_token_id = tokenizer_size - 1
+            model.original_vocab_size = max(1, tokenizer_size - 1)
+            num_params = model.get_num_params()
+            print(f"Updated parameters after vocab alignment: {num_params:,} ({num_params / 1e6:.1f}M)")
     
     train_loader = DataLoader(
         train_dataset, 
