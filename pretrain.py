@@ -806,8 +806,8 @@ class TrainingConfig:
     log_interval: int = 10
     eval_interval: int = 1000
     max_seq_len: int = 512
-    max_train_steps: Optional[int] = None
-    max_samples: Optional[int] = 10000
+    max_train_steps: Optional[int] = 50000
+    max_samples: Optional[int] = 200000
     
     # Model config
     vocab_size: int = 32000
@@ -827,7 +827,7 @@ class TrainingConfig:
     loss_mode: str = "both"  # "ar", "diffusion", or "both"
     ar_loss_weight: float = 1.0
     diffusion_loss_weight: float = 1.0
-    mtp_enabled: bool = False
+    mtp_enabled: bool = True
     mtp_num_heads: int = 3
     mtp_loss_weights: List[float] = field(default_factory=lambda: [1.0, 0.7, 0.5])
     mtp_loss_weight: float = 1.0
@@ -1069,8 +1069,8 @@ def main():
     
     # Training arguments
     parser.add_argument("--epochs", type=int, default=3, help="Number of epochs")
-    parser.add_argument("--max-train-steps", type=int, default=None, help="Hard cap on optimizer update steps")
-    parser.add_argument("--max-samples", type=int, default=10000, help="Maximum number of dataset samples to load/use")
+    parser.add_argument("--max-train-steps", type=int, default=50000, help="Hard cap on optimizer update steps")
+    parser.add_argument("--max-samples", type=int, default=200000, help="Maximum number of dataset samples to load/use")
     parser.add_argument("--batch-size", type=int, default=8, help="Batch size (smaller for long sequences)")
     parser.add_argument("--gradient-checkpointing", action="store_true", help="Enable gradient checkpointing to save memory")
     parser.add_argument("--lr", type=float, default=1e-4, help="Learning rate")
@@ -1095,7 +1095,8 @@ def main():
     parser.add_argument("--loss-mode", type=str, default="both", choices=["ar", "diffusion", "both"], help="Loss mode")
     parser.add_argument("--ar-loss-weight", type=float, default=1.0, help="AR loss weight")
     parser.add_argument("--diffusion-loss-weight", type=float, default=1.0, help="Diffusion loss weight")
-    parser.add_argument("--mtp-enabled", action="store_true", help="Enable Medusa-style MTP heads for AR training")
+    parser.add_argument("--mtp-enabled", action="store_true", default=True, help="Enable Medusa-style MTP heads for AR training (default: enabled)")
+    parser.add_argument("--no-mtp", action="store_true", help="Disable Medusa-style MTP heads")
     parser.add_argument("--mtp-num-heads", type=int, default=3, help="Number of MTP heads")
     parser.add_argument("--mtp-loss-weight", type=float, default=1.0, help="Global weight for combined MTP loss")
     parser.add_argument("--mtp-loss-weights", type=str, default="1.0,0.7,0.5", help="Comma-separated per-head MTP loss weights")
@@ -1108,6 +1109,7 @@ def main():
     
     # Parse MTP loss weights
     mtp_loss_weights = [float(x.strip()) for x in args.mtp_loss_weights.split(",") if x.strip()]
+    mtp_enabled = args.mtp_enabled and (not args.no_mtp)
     
     # Create config
     config = TrainingConfig(
@@ -1137,7 +1139,7 @@ def main():
         loss_mode=args.loss_mode,
         ar_loss_weight=args.ar_loss_weight,
         diffusion_loss_weight=args.diffusion_loss_weight,
-        mtp_enabled=args.mtp_enabled,
+        mtp_enabled=mtp_enabled,
         mtp_num_heads=args.mtp_num_heads,
         mtp_loss_weights=mtp_loss_weights,
         mtp_loss_weight=args.mtp_loss_weight,
