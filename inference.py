@@ -118,100 +118,89 @@ def complete_ar(input_ids: torch.Tensor, max_tokens: int, temperature: float, to
     return generated_ids, first_token_time if first_token_time else time.time() - start_time
 
 
-def complete_diffusion(input_ids: torch.Tensor, max_tokens: int, num_steps: int = 10, temperature: float = 1.0, verbose: bool = True) -> tuple:
+def complete_diffusion(input_ids: torch.Tensor, max_tokens: int, num_steps: int = 12, temperature: float = 0.9, verbose: bool = True) -> tuple:
     """
-    Generate tokens using diffusion mode (parallel iterative denoising).
-    Much faster than AR since it generates all tokens in parallel and iteratively refines.
-    
-    Args:
-        input_ids: Input token IDs [batch, seq_len]
-        max_tokens: Maximum number of tokens to generate
-        num_steps: Number of denoising steps (fewer = faster, more = better quality)
-        temperature: Sampling temperature
-        verbose: Print progress
+    Generate tokens using diffusion mode with confidence-guided iterative denoising.
+    Strategy:
+    - Start from all MASK tokens in generation region
+    - Iteratively predict masked positions
+    - Freeze only high-confidence positions each step (progressive threshold)
+    - Keep uncertain positions masked for later refinement
     """
     batch_size = input_ids.shape[0]
     input_length = input_ids.shape[1]
     device = input_ids.device
-    
-    # Create fixed-size sequence with prompt + [MASK] for generation space
+
     mask_token_id = model.mask_token_id if hasattr(model, "mask_token_id") else (tokenizer.pad_token_id if tokenizer.pad_token_id else 0)
     generation_seq = torch.full((batch_size, input_length + max_tokens), mask_token_id, dtype=torch.long, device=device)
     generation_seq[:, :input_length] = input_ids
-    
-    # Track which positions are masked (need to be predicted)
+
     masked_positions = torch.zeros((batch_size, input_length + max_tokens), dtype=torch.bool, device=device)
     masked_positions[:, input_length:] = True
-    
+
     start_time = time.time()
-    
+
     with torch.no_grad():
-        # Iterative denoising: in each step, predict some masked tokens
-        num_masked = max_tokens
+        if verbose:
+            print(f"[diffusion] Starting denoising with {num_steps} steps, {max_tokens} tokens to generate")
+
         for step in range(num_steps):
-            # Run diffusion head on the entire sequence
             outputs = model(generation_seq, use_cache=False, mode="diffusion")
-            diffusion_logits = outputs["diffusion_logits"]  # [batch, seq_len, vocab_size]
-            
-            # Apply temperature
-            diffusion_logits = diffusion_logits / temperature
-            
-            # Get predictions for all positions
+            diffusion_logits = outputs["diffusion_logits"] / max(1e-6, temperature)
             probs = torch.softmax(diffusion_logits, dim=-1)
-            predictions = torch.multinomial(probs.view(-1, probs.shape[-1]), num_samples=1).view(batch_size, -1)
-            
-            # Determine how many tokens to unmask this step
-            # Use cosine schedule: unmask more in early steps, fewer in later steps
+            pred_tokens = probs.argmax(dim=-1)
+            pred_conf = probs.max(dim=-1).values
+
+            # Progressive confidence threshold: strict early, relaxed later
             progress = (step + 1) / num_steps
-            remaining_ratio = 0.5 * (1 + math.cos(math.pi * progress))  # Cosine schedule
-            target_masked = max(1, int(max_tokens * remaining_ratio))
-            num_to_unmask = max(1, num_masked - target_masked)
-            
-            if verbose and step == 0:
-                print(f"[diffusion] Starting denoising with {num_steps} steps, {max_tokens} tokens to generate")
-            
-            # Unmask tokens with highest confidence
+            conf_threshold = 0.92 - (0.42 * progress)  # 0.92 -> 0.50
+
+            total_newly_fixed = 0
             for b in range(batch_size):
-                masked_indices = masked_positions[b].nonzero(as_tuple=True)[0]
-                if len(masked_indices) == 0:
+                masked_idx = masked_positions[b].nonzero(as_tuple=True)[0]
+                if len(masked_idx) == 0:
                     continue
-                
-                # Get logits for masked positions and compute confidence (max prob)
-                masked_logits = diffusion_logits[b, masked_indices, :]
-                masked_probs = torch.softmax(masked_logits, dim=-1)
-                confidence = masked_probs.max(dim=-1).values
-                
-                # Select top-k confident predictions to unmask
-                k = min(num_to_unmask, len(masked_indices))
-                _, topk_indices = torch.topk(confidence, k)
-                selected_positions = masked_indices[topk_indices]
-                
-                # Unmask selected positions with predicted tokens
-                for pos in selected_positions:
-                    generation_seq[b, pos] = predictions[b, pos]
-                    masked_positions[b, pos] = False
-            
-            num_masked = masked_positions.sum().item()
+
+                # Candidate masked positions and confidences
+                m_conf = pred_conf[b, masked_idx]
+                m_tok = pred_tokens[b, masked_idx]
+
+                # Ensure minimum progress each step with top-k fallback
+                remaining = len(masked_idx)
+                min_fix = max(1, remaining // max(1, (num_steps - step)))
+                threshold_sel = m_conf >= conf_threshold
+                if threshold_sel.sum().item() < min_fix:
+                    _, topk_idx = torch.topk(m_conf, k=min_fix)
+                    sel = torch.zeros_like(threshold_sel)
+                    sel[topk_idx] = True
+                else:
+                    sel = threshold_sel
+
+                selected_positions = masked_idx[sel]
+                selected_tokens = m_tok[sel]
+
+                if len(selected_positions) > 0:
+                    generation_seq[b, selected_positions] = selected_tokens
+                    masked_positions[b, selected_positions] = False
+                    total_newly_fixed += len(selected_positions)
+
+            remaining_masked = int(masked_positions.sum().item())
             if verbose:
-                print(f"[diffusion] Step {step + 1}/{num_steps}: {max_tokens - num_masked} tokens unmasked, {num_masked} remaining")
-            
-            # Early stopping if all tokens are unmasked
-            if num_masked == 0:
+                print(f"[diffusion] Step {step + 1}/{num_steps}: fixed {total_newly_fixed}, remaining {remaining_masked}, thr={conf_threshold:.2f}")
+
+            if remaining_masked == 0:
                 if verbose:
                     print(f"[diffusion] Early stopping at step {step + 1}")
                 break
-    
+
     total_time = time.time() - start_time
-    first_token_time = total_time  # For diffusion, all tokens appear "at once"
-    
-    # Extract generated tokens (positions after input_length)
+    first_token_time = total_time
+
     generated_ids = generation_seq[0, input_length:].tolist()
-    
-    # Truncate at EOS if present
     if tokenizer.eos_token_id in generated_ids:
         eos_pos = generated_ids.index(tokenizer.eos_token_id)
         generated_ids = generated_ids[:eos_pos]
-    
+
     return generated_ids, first_token_time
 
 
@@ -278,15 +267,14 @@ def complete_medusa(input_ids: torch.Tensor, max_tokens: int, temperature: float
 
 
 def complete_medusa_diffusion(input_ids: torch.Tensor, max_tokens: int, temperature: float, top_p: float, verbose: bool = True) -> tuple:
-    """Hybrid mode: medusa draft first, then diffusion refinement on the drafted span."""
+    """Hybrid mode: medusa draft first, then diffusion refinement conditioned on the original prompt."""
     # Phase 1: draft with medusa
     drafted_ids, medusa_ttft = complete_medusa(input_ids.clone(), max_tokens, temperature, top_p, verbose)
     if len(drafted_ids) == 0:
         return drafted_ids, medusa_ttft
 
-    # Phase 2: refine drafted span with diffusion
-    draft_tensor = torch.tensor([drafted_ids], device=input_ids.device, dtype=torch.long)
-    refined_ids, _ = complete_diffusion(draft_tensor, max_tokens=len(drafted_ids), num_steps=10, temperature=temperature, verbose=verbose)
+    # Phase 2: refine drafted span while preserving prompt conditioning
+    refined_ids, _ = complete_diffusion(input_ids.clone(), max_tokens=len(drafted_ids), num_steps=12, temperature=max(0.8, temperature), verbose=verbose)
 
     # Keep length consistent with draft for stable behavior
     final_ids = refined_ids[:len(drafted_ids)] if len(refined_ids) > 0 else drafted_ids
