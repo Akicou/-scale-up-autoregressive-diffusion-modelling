@@ -288,45 +288,31 @@ def expand_linear_layer(
     new_out_features: Optional[int] = None,
     new_in_features: Optional[int] = None,
 ) -> nn.Linear:
-    """
-    Expand a linear layer to new dimensions.
-    
-    Args:
-        old_layer: Old linear layer
-        new_out_features: New output dimension
-        new_in_features: New input dimension
-    
-    Returns:
-        New expanded linear layer
-    """
+    """Expand a linear layer while preserving overlapping weights safely."""
     if new_out_features is None:
         new_out_features = old_layer.out_features
     if new_in_features is None:
         new_in_features = old_layer.in_features
-    
+
     new_layer = nn.Linear(new_in_features, new_out_features, bias=old_layer.bias is not None)
-    
-    # Copy weights
+
     with torch.no_grad():
-        if new_out_features >= old_layer.out_features and new_in_features >= old_layer.in_features:
-            # Expand
-            new_layer.weight.data[:old_layer.out_features, :old_layer.in_features] = old_layer.weight.data
-            if old_layer.bias is not None:
-                new_layer.bias.data[:old_layer.out_features] = old_layer.bias.data
-        elif new_out_features <= old_layer.out_features and new_in_features <= old_layer.in_features:
-            # Truncate
-            new_layer.weight.data = old_layer.weight.data[:new_out_features, :new_in_features]
-            if old_layer.bias is not None:
-                new_layer.bias.data = old_layer.bias.data[:new_out_features]
-        else:
-            # Copy what fits
-            copy_out = min(new_out_features, old_layer.out_features)
-            copy_in = min(new_in_features, old_layer.in_features)
-            new_layer.weight.data[:copy_out, :copy_in] = old_layer.weight.data[:copy_out, :copy_in]
-            if old_layer.bias is not None:
-                new_layer.bias.data[:copy_out] = old_layer.bias.data[:copy_out]
-    
+        copy_out = min(new_out_features, old_layer.out_features)
+        copy_in = min(new_in_features, old_layer.in_features)
+        new_layer.weight[:copy_out, :copy_in] = old_layer.weight[:copy_out, :copy_in]
+        if old_layer.bias is not None and new_layer.bias is not None:
+            new_layer.bias[:copy_out] = old_layer.bias[:copy_out]
+
     return new_layer
+
+
+def _copy_param_overlap(dst: torch.Tensor, src: torch.Tensor) -> None:
+    """Copy overlapping region from src tensor into dst tensor without changing dst shape."""
+    with torch.no_grad():
+        if dst.ndim != src.ndim:
+            raise ValueError(f"Rank mismatch: dst {dst.shape} vs src {src.shape}")
+        slices = tuple(slice(0, min(d, s)) for d, s in zip(dst.shape, src.shape))
+        dst[slices] = src[slices]
 
 
 def scale_model_width(
@@ -364,94 +350,84 @@ def scale_model_width(
             model.token_embeddings,
             new_embedding_dim=new_config["hidden_size"],
         )
-        
+
         # Scale position embeddings (interpolate if needed)
         new_model.position_embeddings = interpolate_position_embeddings(
             model.position_embeddings,
             new_config["max_seq_len"],
         )
-        
+
         # Scale layer norm
-        new_model.embed_layernorm.weight.data = model.embed_layernorm.weight.data.clone()
-        new_model.embed_layernorm.bias.data = model.embed_layernorm.bias.data.clone()
-        
+        _copy_param_overlap(new_model.embed_layernorm.weight, model.embed_layernorm.weight)
+        _copy_param_overlap(new_model.embed_layernorm.bias, model.embed_layernorm.bias)
+
         # Scale each transformer layer
         for new_layer, old_layer in zip(new_model.layers, model.layers):
-            # Scale attention
-            new_layer.attention.q_proj = expand_linear_layer(
-                old_layer.attention.q_proj,
-                new_out_features=new_config["num_heads"] * new_config["head_dim"],
-            )
-            new_layer.attention.k_proj = expand_linear_layer(
-                old_layer.attention.k_proj,
-                new_out_features=new_config["num_heads"] * new_config["head_dim"],
-            )
-            new_layer.attention.v_proj = expand_linear_layer(
-                old_layer.attention.v_proj,
-                new_out_features=new_config["num_heads"] * new_config["head_dim"],
-            )
-            new_layer.attention.o_proj = expand_linear_layer(
-                old_layer.attention.o_proj,
-                new_in_features=new_config["num_heads"] * new_config["head_dim"],
-            )
-            
+            # Attention projections (expand BOTH in/out dimensions as needed)
+            _copy_param_overlap(new_layer.attention.q_proj.weight, old_layer.attention.q_proj.weight)
+            if new_layer.attention.q_proj.bias is not None and old_layer.attention.q_proj.bias is not None:
+                _copy_param_overlap(new_layer.attention.q_proj.bias, old_layer.attention.q_proj.bias)
+
+            _copy_param_overlap(new_layer.attention.k_proj.weight, old_layer.attention.k_proj.weight)
+            if new_layer.attention.k_proj.bias is not None and old_layer.attention.k_proj.bias is not None:
+                _copy_param_overlap(new_layer.attention.k_proj.bias, old_layer.attention.k_proj.bias)
+
+            _copy_param_overlap(new_layer.attention.v_proj.weight, old_layer.attention.v_proj.weight)
+            if new_layer.attention.v_proj.bias is not None and old_layer.attention.v_proj.bias is not None:
+                _copy_param_overlap(new_layer.attention.v_proj.bias, old_layer.attention.v_proj.bias)
+
+            _copy_param_overlap(new_layer.attention.o_proj.weight, old_layer.attention.o_proj.weight)
+            if new_layer.attention.o_proj.bias is not None and old_layer.attention.o_proj.bias is not None:
+                _copy_param_overlap(new_layer.attention.o_proj.bias, old_layer.attention.o_proj.bias)
+
             # Update RoPE
             new_layer.attention.rope = new_model.layers[0].attention.rope
-            
-            # Scale MLP
-            mlp_expand = int(new_config["hidden_size"] * new_config["mlp_ratio"])
-            old_mlp_expand = int(old_config["hidden_size"] * old_config["mlp_ratio"])
-            
-            new_layer.mlp.gate_proj = expand_linear_layer(
-                old_layer.mlp.gate_proj,
-                new_out_features=mlp_expand,
-            )
-            new_layer.mlp.up_proj = expand_linear_layer(
-                old_layer.mlp.up_proj,
-                new_out_features=mlp_expand,
-            )
-            new_layer.mlp.down_proj = expand_linear_layer(
-                old_layer.mlp.down_proj,
-                new_in_features=mlp_expand,
-            )
-            
+
+            # Scale MLP projections
+            _copy_param_overlap(new_layer.mlp.gate_proj.weight, old_layer.mlp.gate_proj.weight)
+            if new_layer.mlp.gate_proj.bias is not None and old_layer.mlp.gate_proj.bias is not None:
+                _copy_param_overlap(new_layer.mlp.gate_proj.bias, old_layer.mlp.gate_proj.bias)
+
+            _copy_param_overlap(new_layer.mlp.up_proj.weight, old_layer.mlp.up_proj.weight)
+            if new_layer.mlp.up_proj.bias is not None and old_layer.mlp.up_proj.bias is not None:
+                _copy_param_overlap(new_layer.mlp.up_proj.bias, old_layer.mlp.up_proj.bias)
+
+            _copy_param_overlap(new_layer.mlp.down_proj.weight, old_layer.mlp.down_proj.weight)
+            if new_layer.mlp.down_proj.bias is not None and old_layer.mlp.down_proj.bias is not None:
+                _copy_param_overlap(new_layer.mlp.down_proj.bias, old_layer.mlp.down_proj.bias)
+
             # Scale layer norms
-            new_layer.input_layernorm.weight.data = old_layer.input_layernorm.weight.data.clone()
-            new_layer.input_layernorm.bias.data = old_layer.input_layernorm.bias.data.clone()
-            new_layer.post_attention_layernorm.weight.data = old_layer.post_attention_layernorm.weight.data.clone()
-            new_layer.post_attention_layernorm.bias.data = old_layer.post_attention_layernorm.bias.data.clone()
-        
+            _copy_param_overlap(new_layer.input_layernorm.weight, old_layer.input_layernorm.weight)
+            _copy_param_overlap(new_layer.input_layernorm.bias, old_layer.input_layernorm.bias)
+            _copy_param_overlap(new_layer.post_attention_layernorm.weight, old_layer.post_attention_layernorm.weight)
+            _copy_param_overlap(new_layer.post_attention_layernorm.bias, old_layer.post_attention_layernorm.bias)
+
         # Scale final layer norm
-        new_model.final_layernorm.weight.data = model.final_layernorm.weight.data.clone()
-        new_model.final_layernorm.bias.data = model.final_layernorm.bias.data.clone()
-        
-        # Scale AR head - expand the lm_head inside ARHead
-        new_ar_head_lm_head = expand_linear_layer(
-            model.ar_head.lm_head,
-            new_in_features=new_config["hidden_size"],
-        )
-        new_model.ar_head.lm_head = new_ar_head_lm_head
-        
+        _copy_param_overlap(new_model.final_layernorm.weight, model.final_layernorm.weight)
+        _copy_param_overlap(new_model.final_layernorm.bias, model.final_layernorm.bias)
+
+        # Scale AR head
+        _copy_param_overlap(new_model.ar_head.lm_head.weight, model.ar_head.lm_head.weight)
+        if new_model.ar_head.lm_head.bias is not None and model.ar_head.lm_head.bias is not None:
+            _copy_param_overlap(new_model.ar_head.lm_head.bias, model.ar_head.lm_head.bias)
+
         # Scale diffusion head
-        new_model.diffusion_head.dense = expand_linear_layer(
-            model.diffusion_head.dense,
-            new_in_features=new_config["hidden_size"],
-        )
-        new_model.diffusion_head.decoder = expand_linear_layer(
-            model.diffusion_head.decoder,
-            new_out_features=new_config["vocab_size"],
-        )
-        new_model.diffusion_head.layer_norm.weight.data = model.diffusion_head.layer_norm.weight.data.clone()
-        new_model.diffusion_head.layer_norm.bias.data = model.diffusion_head.layer_norm.bias.data.clone()
+        _copy_param_overlap(new_model.diffusion_head.dense.weight, model.diffusion_head.dense.weight)
+        if new_model.diffusion_head.dense.bias is not None and model.diffusion_head.dense.bias is not None:
+            _copy_param_overlap(new_model.diffusion_head.dense.bias, model.diffusion_head.dense.bias)
+        _copy_param_overlap(new_model.diffusion_head.layer_norm.weight, model.diffusion_head.layer_norm.weight)
+        _copy_param_overlap(new_model.diffusion_head.layer_norm.bias, model.diffusion_head.layer_norm.bias)
+        _copy_param_overlap(new_model.diffusion_head.decoder.weight, model.diffusion_head.decoder.weight)
+        if new_model.diffusion_head.decoder.bias is not None and model.diffusion_head.decoder.bias is not None:
+            _copy_param_overlap(new_model.diffusion_head.decoder.bias, model.diffusion_head.decoder.bias)
 
         # Scale MTP heads if enabled
         if getattr(model, "mtp_enabled", False) and len(getattr(model, "mtp_heads", [])) > 0:
             for idx, old_mtp_head in enumerate(model.mtp_heads):
                 if idx < len(new_model.mtp_heads):
-                    new_model.mtp_heads[idx].lm_head = expand_linear_layer(
-                        old_mtp_head.lm_head,
-                        new_in_features=new_config["hidden_size"],
-                    )
+                    _copy_param_overlap(new_model.mtp_heads[idx].lm_head.weight, old_mtp_head.lm_head.weight)
+                    if new_model.mtp_heads[idx].lm_head.bias is not None and old_mtp_head.lm_head.bias is not None:
+                        _copy_param_overlap(new_model.mtp_heads[idx].lm_head.bias, old_mtp_head.lm_head.bias)
     
     return new_model
 
