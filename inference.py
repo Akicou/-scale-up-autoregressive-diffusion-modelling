@@ -56,18 +56,14 @@ def load_model(checkpoint_path: str, config_path: str, device_str: str = None):
     model.eval()
     
     tokenizer = get_default_tokenizer()
-    
-    # Add special tokens for reasoning
-    special_tokens = ["<thinking>", "</thinking>", "<reasoning>", "</reasoning>", "<output>", "</output>"]
-    num_added = tokenizer.add_tokens(special_tokens)
-    if num_added > 0:
-        print(f"Added {num_added} special tokens: {special_tokens}")
-        # Resize model embeddings to accommodate new tokens
-        model.token_embeddings = torch.nn.Embedding(len(tokenizer), model.hidden_size).to(device)
-        # Initialize new embeddings
-        with torch.no_grad():
-            torch.nn.init.normal_(model.token_embeddings.weight, mean=0.0, std=0.02)
-        print(f"Resized token embeddings to {len(tokenizer)} tokens")
+
+    # IMPORTANT: Do NOT mutate tokenizer/model vocab at inference unless checkpoint was trained that way.
+    # Reinitializing embeddings destroys learned lexical mapping and harms generation quality.
+    model_vocab_size = model.token_embeddings.num_embeddings
+    tokenizer_size = len(tokenizer)
+    if tokenizer_size != model_vocab_size:
+        print(f"Warning: tokenizer size ({tokenizer_size}) != model vocab size ({model_vocab_size}).")
+        print("Using model vocab size for stable decoding and skipping tokenizer vocab expansion.")
     
     print(f"Model loaded: {sum(p.numel() for p in model.parameters())/1e6:.1f}M params")
     
