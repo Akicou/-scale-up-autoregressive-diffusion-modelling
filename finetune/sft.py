@@ -29,6 +29,7 @@ except ImportError:
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset
 from transformers import (
     AutoModelForCausalLM,
@@ -316,11 +317,65 @@ class ToolCallingDataset(Dataset):
 
 
 class CustomDualModeAdapterModel(nn.Module):
-    """HF-like wrapper exposing save_pretrained for custom DualModeModel checkpoints."""
+    """Wrapper for custom DualModeModel with optional LoRA adapters on projection layers."""
 
-    def __init__(self, model: DualModeModel):
+    def __init__(self, model: DualModeModel, use_lora: bool = False, lora_r: int = 8, lora_alpha: int = 16, lora_dropout: float = 0.05):
         super().__init__()
         self.model = model
+        self.lora_enabled = use_lora
+        self.lora_r = int(lora_r)
+        self.lora_alpha = float(lora_alpha)
+        self.lora_dropout = float(lora_dropout)
+        self._lora_modules = nn.ModuleList()
+
+        if self.lora_enabled:
+            self._inject_lora()
+
+    class _LoRALinear(nn.Module):
+        def __init__(self, base: nn.Linear, r: int, alpha: float, dropout: float):
+            super().__init__()
+            self.base = base
+            self.r = max(1, int(r))
+            self.scaling = float(alpha) / float(self.r)
+            self.dropout = nn.Dropout(dropout)
+            self.A = nn.Parameter(torch.zeros(self.r, base.in_features))
+            self.B = nn.Parameter(torch.zeros(base.out_features, self.r))
+            nn.init.kaiming_uniform_(self.A, a=math.sqrt(5))
+            nn.init.zeros_(self.B)
+            for p in self.base.parameters():
+                p.requires_grad = False
+
+        def forward(self, x):
+            base_out = self.base(x)
+            lora_out = F.linear(F.linear(self.dropout(x), self.A), self.B) * self.scaling
+            return base_out + lora_out
+
+    def _replace_linear(self, parent: nn.Module, attr_name: str):
+        layer = getattr(parent, attr_name)
+        if not isinstance(layer, nn.Linear):
+            return
+        lora_layer = self._LoRALinear(layer, self.lora_r, self.lora_alpha, self.lora_dropout)
+        setattr(parent, attr_name, lora_layer)
+        self._lora_modules.append(lora_layer)
+
+    def _inject_lora(self):
+        for p in self.model.parameters():
+            p.requires_grad = False
+
+        for block in self.model.layers:
+            self._replace_linear(block.attention, "q_proj")
+            self._replace_linear(block.attention, "k_proj")
+            self._replace_linear(block.attention, "v_proj")
+            self._replace_linear(block.attention, "o_proj")
+            self._replace_linear(block.mlp, "gate_proj")
+            self._replace_linear(block.mlp, "up_proj")
+            self._replace_linear(block.mlp, "down_proj")
+
+    def print_trainable_parameters(self):
+        trainable = sum(p.numel() for p in self.parameters() if p.requires_grad)
+        total = sum(p.numel() for p in self.parameters())
+        pct = (100.0 * trainable / total) if total > 0 else 0.0
+        print(f"trainable params: {trainable:,} || all params: {total:,} || trainable%: {pct:.4f}")
 
     def forward(self, input_ids=None, attention_mask=None, labels=None, **kwargs):
         outputs = self.model(input_ids, labels=labels, mode="ar", is_training=labels is not None)
@@ -331,6 +386,20 @@ class CustomDualModeAdapterModel(nn.Module):
     def save_pretrained(self, save_directory):
         save_dir = Path(save_directory)
         save_dir.mkdir(parents=True, exist_ok=True)
+
+        if self.lora_enabled:
+            lora_state = {}
+            for name, module in self.named_modules():
+                if isinstance(module, self._LoRALinear):
+                    lora_state[f"{name}.A"] = module.A.detach().cpu()
+                    lora_state[f"{name}.B"] = module.B.detach().cpu()
+            torch.save({
+                "lora_state": lora_state,
+                "lora_r": self.lora_r,
+                "lora_alpha": self.lora_alpha,
+                "lora_dropout": self.lora_dropout,
+            }, save_dir / "adapter.pt")
+
         torch.save(self.model.state_dict(), save_dir / "model.pt")
         torch.save({
             "vocab_size": self.model.vocab_size,
@@ -432,7 +501,15 @@ class SFTTrainer(BaseFinetuner):
                 patched[slices] = src[slices]
                 base_model.load_state_dict({k: patched}, strict=False)
 
-            model = CustomDualModeAdapterModel(base_model)
+            model = CustomDualModeAdapterModel(
+                base_model,
+                use_lora=self.config.use_lora,
+                lora_r=self.config.lora_r,
+                lora_alpha=self.config.lora_alpha,
+                lora_dropout=self.config.lora_dropout,
+            )
+            if self.config.use_lora:
+                model.print_trainable_parameters()
             model._is_custom_dualmode = True
             return model
 
