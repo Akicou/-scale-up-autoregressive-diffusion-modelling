@@ -58,7 +58,7 @@ def complete(prompt: str, max_tokens: int = 100, temperature: float = 1.0, top_p
             ar_logits = outputs.get("ar_logits")
             diffusion_logits = outputs.get("diffusion_logits")
             
-            if mode == "combined":
+            if mode == "combined" or mode == "reasoning":
                 # Average logits from both modes
                 if ar_logits is not None and diffusion_logits is not None:
                     logits = (ar_logits + diffusion_logits) / 2
@@ -113,7 +113,7 @@ def main():
     parser.add_argument("--max-tokens", type=int, default=100, help="Max tokens to generate")
     parser.add_argument("--temperature", type=float, default=1.0, help="Sampling temperature")
     parser.add_argument("--top-p", type=float, default=1.0, help="Nucleus sampling")
-    parser.add_argument("--mode", type=str, default="ar", choices=["ar", "diffusion", "combined"], help="Generation mode")
+    parser.add_argument("--mode", type=str, default="ar", choices=["ar", "diffusion", "combined", "reasoning"], help="Generation mode: ar=auto-regressive, diffusion=masked, combined=avg both, reasoning=AR then diffusion")
     parser.add_argument("--quiet", action="store_true", help="Suppress verbose output")
     args = parser.parse_args()
     
