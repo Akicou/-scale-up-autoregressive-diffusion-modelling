@@ -445,8 +445,6 @@ class SFTTrainer(BaseFinetuner):
         if self._is_custom_checkpoint_dir(self.config.model_path):
             if self.config.use_qlora:
                 raise ValueError("QLoRA is only supported for Hugging Face model directories in this trainer")
-            if self.config.use_lora:
-                raise ValueError("LoRA adapters are only supported for Hugging Face model directories in this trainer")
             custom_cfg = torch.load(Path(self.config.model_path) / "config.pt", map_location="cpu")
 
             # Handle both pretrain checkpoint config and scale_up config wrappers
