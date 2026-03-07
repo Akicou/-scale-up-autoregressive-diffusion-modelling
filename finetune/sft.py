@@ -379,18 +379,26 @@ class SFTTrainer(BaseFinetuner):
             if self.config.use_lora:
                 raise ValueError("LoRA adapters are only supported for Hugging Face model directories in this trainer")
             custom_cfg = torch.load(Path(self.config.model_path) / "config.pt", map_location="cpu")
-            base_vocab = custom_cfg.get("original_vocab_size", custom_cfg.get("vocab_size", 16001) - 1)
+
+            # Handle both pretrain checkpoint config and scale_up config wrappers
+            model_cfg = custom_cfg.get("target_config", custom_cfg)
+            base_vocab = model_cfg.get("original_vocab_size")
+            if base_vocab is None:
+                base_vocab = model_cfg.get("base_vocab_size")
+            if base_vocab is None:
+                base_vocab = model_cfg.get("vocab_size", 16001) - 1
+
             base_model = DualModeModel(
                 vocab_size=base_vocab,
-                hidden_size=custom_cfg.get("hidden_size", 256),
-                num_layers=custom_cfg.get("num_layers", 6),
-                num_heads=custom_cfg.get("num_heads", 4),
-                head_dim=custom_cfg.get("head_dim", 64),
-                mlp_ratio=custom_cfg.get("mlp_ratio", 4.0),
-                max_seq_len=custom_cfg.get("max_seq_len", 4096),
-                mtp_enabled=custom_cfg.get("mtp_enabled", False),
-                mtp_num_heads=custom_cfg.get("mtp_num_heads", 3),
-                mtp_loss_weights=custom_cfg.get("mtp_loss_weights", [1.0, 0.7, 0.5]),
+                hidden_size=model_cfg.get("hidden_size", 256),
+                num_layers=model_cfg.get("num_layers", 6),
+                num_heads=model_cfg.get("num_heads", 4),
+                head_dim=model_cfg.get("head_dim", 64),
+                mlp_ratio=model_cfg.get("mlp_ratio", 4.0),
+                max_seq_len=model_cfg.get("max_seq_len", 4096),
+                mtp_enabled=model_cfg.get("mtp_enabled", False),
+                mtp_num_heads=model_cfg.get("mtp_num_heads", 3),
+                mtp_loss_weights=model_cfg.get("mtp_loss_weights", [1.0, 0.7, 0.5]),
             )
             state_dict = torch.load(Path(self.config.model_path) / "model.pt", map_location="cpu")
             base_model.load_state_dict(state_dict)
