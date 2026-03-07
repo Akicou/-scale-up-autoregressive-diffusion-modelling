@@ -674,6 +674,12 @@ def get_default_tokenizer():
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
     
+    # Add special tokens for reasoning/thinking
+    special_tokens = ["<thinking>", "</thinking>", "<reasoning>", "</reasoning>", "<output>", "</output>"]
+    num_added = tokenizer.add_tokens(special_tokens)
+    if num_added > 0:
+        print(f"Added {num_added} special tokens for reasoning: {special_tokens}")
+    
     return tokenizer
 
 
@@ -979,6 +985,20 @@ def main():
     print(f"\nTotal parameters: {num_params:,} ({num_params / 1e6:.1f}M)")
     
     model = model.to(device)
+    
+    # Resize token embeddings if tokenizer has more tokens (due to special tokens)
+    if hasattr(tokenizer, 'vocab_size') and tokenizer.vocab_size > model.vocab_size:
+        print(f"Resizing token embeddings from {model.vocab_size} to {len(tokenizer)}")
+        model.vocab_size = len(tokenizer)
+        old_embeddings = model.token_embeddings
+        model.token_embeddings = nn.Embedding(len(tokenizer), model.hidden_size).to(device)
+        # Copy old embeddings
+        with torch.no_grad():
+            model.token_embeddings.weight[:old_embeddings.num_embeddings] = old_embeddings.weight
+        # Initialize new embeddings
+        torch.nn.init.normal_(model.token_embeddings.weight[old_embeddings.num_embeddings:], mean=0.0, std=0.02)
+        num_params = model.get_num_params()
+        print(f"Updated parameters: {num_params:,} ({num_params / 1e6:.1f}M)")
     
     # Enable gradient checkpointing
     if config.use_gradient_checkpointing:

@@ -15,11 +15,14 @@ device = None
 
 def load_model(checkpoint_path: str, config_path: str, device_str: str = None):
     global model, tokenizer, device
+    
     config = torch.load(config_path, map_location="cpu")
+    
     if device_str is None:
         device_str = "cuda" if torch.cuda.is_available() else "cpu"
     device = torch.device(device_str)
     print(f"Using device: {device}")
+    
     model = DualModeModel(
         vocab_size=config.get("vocab_size", 16000),
         hidden_size=config.get("hidden_size", 256),
@@ -29,12 +32,28 @@ def load_model(checkpoint_path: str, config_path: str, device_str: str = None):
         max_seq_len=config.get("max_seq_len", 8192),
         use_flash_attn=False,
     )
+    
     state_dict = torch.load(checkpoint_path, map_location=device)
     model.load_state_dict(state_dict)
     model = model.to(device)
     model.eval()
+    
     tokenizer = get_default_tokenizer()
+    
+    # Add special tokens for reasoning
+    special_tokens = ["<thinking>", "</thinking>", "<reasoning>", "</reasoning>", "<output>", "</output>"]
+    num_added = tokenizer.add_tokens(special_tokens)
+    if num_added > 0:
+        print(f"Added {num_added} special tokens: {special_tokens}")
+        # Resize model embeddings to accommodate new tokens
+        model.token_embeddings = torch.nn.Embedding(len(tokenizer), model.hidden_size).to(device)
+        # Initialize new embeddings
+        with torch.no_grad():
+            torch.nn.init.normal_(model.token_embeddings.weight, mean=0.0, std=0.02)
+        print(f"Resized token embeddings to {len(tokenizer)} tokens")
+    
     print(f"Model loaded: {sum(p.numel() for p in model.parameters())/1e6:.1f}M params")
+    
     return model, tokenizer
 
 
