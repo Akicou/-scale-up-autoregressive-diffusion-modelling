@@ -307,6 +307,9 @@ class DualModeModel(nn.Module):
         use_flash_attn: bool = False,
         gradient_checkpointing: bool = False,
         diffusion_mask_prob: float = 0.15,  # Probability of masking tokens for diffusion training
+        mtp_enabled: bool = False,
+        mtp_num_heads: int = 3,
+        mtp_loss_weights: Optional[List[float]] = None,
     ):
         super().__init__()
         self.gradient_checkpointing = gradient_checkpointing
@@ -320,9 +323,16 @@ class DualModeModel(nn.Module):
         self.num_layers = num_layers
         self.num_heads = num_heads
         self.head_dim = head_dim
+        self.mlp_ratio = mlp_ratio
         self.max_seq_len = max_seq_len
         self.use_flash_attn = use_flash_attn and HAS_FLASH_ATTN
         self.diffusion_mask_prob = diffusion_mask_prob
+        self.mtp_enabled = mtp_enabled
+        self.mtp_num_heads = mtp_num_heads
+        if mtp_loss_weights is None:
+            # Balanced default requested by user
+            mtp_loss_weights = [1.0, 0.7, 0.5]
+        self.mtp_loss_weights = mtp_loss_weights
         
         # Embeddings - use vocab_size + 1 to include mask token
         self.token_embeddings = nn.Embedding(self.vocab_size, hidden_size)
@@ -342,9 +352,13 @@ class DualModeModel(nn.Module):
         # Final layer norm
         self.final_layernorm = nn.LayerNorm(hidden_size, eps=1e-6)
         
-        # Two heads sharing the backbone
+        # Heads sharing the backbone
         self.ar_head = ARHead(hidden_size, vocab_size)
         self.diffusion_head = DiffusionHead(hidden_size, vocab_size)
+        # Medusa-like MTP heads for AR multi-token prediction
+        self.mtp_heads = nn.ModuleList([
+            ARHead(hidden_size, vocab_size) for _ in range(self.mtp_num_heads)
+        ]) if self.mtp_enabled else nn.ModuleList()
         
         # Initialize weights
         self._init_weights()
@@ -458,6 +472,13 @@ class DualModeModel(nn.Module):
         if mode in ("ar", "both"):
             ar_logits = self.ar_head(hidden_states)
             outputs["ar_logits"] = ar_logits
+
+            # MTP logits are available in both training and inference for Medusa-style decoding
+            mtp_logits = []
+            if self.mtp_enabled and len(self.mtp_heads) > 0:
+                for mtp_head in self.mtp_heads:
+                    mtp_logits.append(mtp_head(hidden_states))
+                outputs["mtp_logits"] = mtp_logits
             
             if labels is not None:
                 # Shift for causal language modeling
@@ -469,6 +490,26 @@ class DualModeModel(nn.Module):
                 loss_fct = nn.CrossEntropyLoss(ignore_index=-100)
                 ar_loss = loss_fct(shift_logits.view(-1, self.vocab_size), shift_labels.view(-1))
                 outputs["ar_loss"] = ar_loss
+
+                # MTP loss: head i predicts token at t+(i+1)
+                if self.mtp_enabled and len(mtp_logits) > 0:
+                    mtp_losses = []
+                    for i, h_logits in enumerate(mtp_logits):
+                        horizon = i + 1
+                        if seq_len > horizon:
+                            h_shift_logits = h_logits[..., :-horizon, :].contiguous()
+                            h_shift_labels = labels[..., horizon:].contiguous().clamp(0, self.vocab_size - 1)
+                            h_loss = loss_fct(h_shift_logits.view(-1, self.vocab_size), h_shift_labels.view(-1))
+                        else:
+                            h_loss = torch.tensor(0.0, device=hidden_states.device)
+                        mtp_losses.append(h_loss)
+
+                    outputs["mtp_losses"] = mtp_losses
+                    mtp_weighted_loss = 0.0
+                    for i, h_loss in enumerate(mtp_losses):
+                        weight = self.mtp_loss_weights[i] if i < len(self.mtp_loss_weights) else 1.0
+                        mtp_weighted_loss = mtp_weighted_loss + (weight * h_loss)
+                    outputs["mtp_loss"] = mtp_weighted_loss
         
         # Diffusion head - for masked token prediction
         if mode in ("diffusion", "both"):
@@ -773,6 +814,10 @@ class TrainingConfig:
     loss_mode: str = "both"  # "ar", "diffusion", or "both"
     ar_loss_weight: float = 1.0
     diffusion_loss_weight: float = 1.0
+    mtp_enabled: bool = False
+    mtp_num_heads: int = 3
+    mtp_loss_weights: List[float] = field(default_factory=lambda: [1.0, 0.7, 0.5])
+    mtp_loss_weight: float = 1.0
     
     # Logging
     wandb_project: Optional[str] = None
@@ -807,6 +852,7 @@ def train_epoch(
     total_loss = 0.0
     total_ar_loss = 0.0
     total_diffusion_loss = 0.0
+    total_mtp_loss = 0.0
     num_batches = 0
     
     is_main_process = accelerator is None or accelerator.is_main_process
@@ -830,6 +876,10 @@ def train_epoch(
             loss = outputs.get("diffusion_loss", 0)
         else:
             loss = outputs.get("ar_loss", 0)
+
+        # Add MTP loss (if enabled and available)
+        if config.mtp_enabled and outputs.get("mtp_loss") is not None:
+            loss = loss + (config.mtp_loss_weight * outputs.get("mtp_loss", 0))
         
         # Scale loss for gradient accumulation
         loss = loss / config.accumulation_steps
@@ -856,20 +906,25 @@ def train_epoch(
         loss_value = loss.item() * config.accumulation_steps
         ar_loss_value = outputs["ar_loss"].item() if outputs.get("ar_loss") is not None else 0.0
         diffusion_loss_value = outputs["diffusion_loss"].item() if outputs.get("diffusion_loss") is not None else 0.0
+        mtp_loss_value = outputs["mtp_loss"].item() if outputs.get("mtp_loss") is not None else 0.0
         
         if accelerator is not None:
             loss_tensor = torch.tensor(loss_value, device=outputs["ar_logits"].device if outputs.get("ar_logits") is not None else outputs["diffusion_logits"].device)
             ar_loss_tensor = torch.tensor(ar_loss_value, device=loss_tensor.device)
             diffusion_loss_tensor = torch.tensor(diffusion_loss_value, device=loss_tensor.device)
+            mtp_loss_tensor = torch.tensor(mtp_loss_value, device=loss_tensor.device)
             loss_value = accelerator.gather_for_metrics(loss_tensor).mean().item()
             ar_loss_value = accelerator.gather_for_metrics(ar_loss_tensor).mean().item()
             diffusion_loss_value = accelerator.gather_for_metrics(diffusion_loss_tensor).mean().item()
+            mtp_loss_value = accelerator.gather_for_metrics(mtp_loss_tensor).mean().item()
         
         total_loss += loss_value
         if outputs.get("ar_loss") is not None:
             total_ar_loss += ar_loss_value
         if outputs.get("diffusion_loss") is not None:
             total_diffusion_loss += diffusion_loss_value
+        if outputs.get("mtp_loss") is not None:
+            total_mtp_loss += mtp_loss_value
         num_batches += 1
         
         pbar.set_postfix({
@@ -884,6 +939,7 @@ def train_epoch(
                     "train/loss": total_loss / num_batches,
                     "train/ar_loss": total_ar_loss / max(1, num_batches),
                     "train/diffusion_loss": total_diffusion_loss / max(1, num_batches),
+                    "train/mtp_loss": total_mtp_loss / max(1, num_batches),
                     "train/lr": optimizer.param_groups[0]["lr"],
                     "train/step": epoch * len(dataloader) + batch_idx,
                 })
@@ -893,6 +949,7 @@ def train_epoch(
         "loss": total_loss / denom,
         "ar_loss": total_ar_loss / denom if total_ar_loss > 0 else None,
         "diffusion_loss": total_diffusion_loss / denom if total_diffusion_loss > 0 else None,
+        "mtp_loss": total_mtp_loss / denom if total_mtp_loss > 0 else None,
     }
 
 
@@ -917,6 +974,9 @@ def evaluate(model: nn.Module, dataloader: DataLoader, config: TrainingConfig, a
                 loss = outputs.get("ar_loss", 0)
             else:
                 loss = outputs.get("ar_loss", 0)
+
+            if config.mtp_enabled and outputs.get("mtp_loss") is not None:
+                loss = loss + (config.mtp_loss_weight * outputs.get("mtp_loss", 0))
             
             loss_value = loss.item()
             if accelerator is not None:
@@ -954,6 +1014,10 @@ def save_checkpoint(model: nn.Module, optimizer: torch.optim.Optimizer, schedule
         "num_heads": unwrapped_model.num_heads,
         "head_dim": unwrapped_model.head_dim,
         "max_seq_len": unwrapped_model.max_seq_len,
+        "mlp_ratio": getattr(unwrapped_model, "mlp_ratio", 4.0),
+        "mtp_enabled": getattr(unwrapped_model, "mtp_enabled", False),
+        "mtp_num_heads": getattr(unwrapped_model, "mtp_num_heads", 0),
+        "mtp_loss_weights": getattr(unwrapped_model, "mtp_loss_weights", [1.0, 0.7, 0.5]),
     }
     torch.save(config_dict, save_path / "config.pt")
     
@@ -1007,12 +1071,19 @@ def main():
     parser.add_argument("--loss-mode", type=str, default="both", choices=["ar", "diffusion", "both"], help="Loss mode")
     parser.add_argument("--ar-loss-weight", type=float, default=1.0, help="AR loss weight")
     parser.add_argument("--diffusion-loss-weight", type=float, default=1.0, help="Diffusion loss weight")
+    parser.add_argument("--mtp-enabled", action="store_true", help="Enable Medusa-style MTP heads for AR training")
+    parser.add_argument("--mtp-num-heads", type=int, default=3, help="Number of MTP heads")
+    parser.add_argument("--mtp-loss-weight", type=float, default=1.0, help="Global weight for combined MTP loss")
+    parser.add_argument("--mtp-loss-weights", type=str, default="1.0,0.7,0.5", help="Comma-separated per-head MTP loss weights")
     
     # Logging
     parser.add_argument("--wandb-project", type=str, default=None, help="WandB project name")
     parser.add_argument("--use-accelerate", action="store_true", help="Enable accelerate-based multi-GPU training")
     
     args = parser.parse_args()
+    
+    # Parse MTP loss weights
+    mtp_loss_weights = [float(x.strip()) for x in args.mtp_loss_weights.split(",") if x.strip()]
     
     # Create config
     config = TrainingConfig(
@@ -1040,6 +1111,10 @@ def main():
         loss_mode=args.loss_mode,
         ar_loss_weight=args.ar_loss_weight,
         diffusion_loss_weight=args.diffusion_loss_weight,
+        mtp_enabled=args.mtp_enabled,
+        mtp_num_heads=args.mtp_num_heads,
+        mtp_loss_weights=mtp_loss_weights,
+        mtp_loss_weight=args.mtp_loss_weight,
         wandb_project=args.wandb_project,
     )
     
@@ -1069,6 +1144,7 @@ def main():
     print(f"Num heads: {config.num_heads}")
     print(f"Head dim: {config.head_dim}")
     print(f"Flash Attention: {config.use_flash_attention}")
+    print(f"MTP Enabled: {config.mtp_enabled} (heads={config.mtp_num_heads}, weights={config.mtp_loss_weights})")
     
     tokenizer = None
     model = DualModeModel(
@@ -1081,6 +1157,9 @@ def main():
         max_seq_len=config.max_seq_len,
         use_flash_attn=config.use_flash_attention,
         gradient_checkpointing=config.use_gradient_checkpointing,
+        mtp_enabled=config.mtp_enabled,
+        mtp_num_heads=config.mtp_num_heads,
+        mtp_loss_weights=config.mtp_loss_weights,
     )
     
     num_params = model.get_num_params()
@@ -1089,7 +1168,7 @@ def main():
     model = model.to(device)
     
     # Resize token embeddings if tokenizer has more tokens (due to special tokens)
-    if hasattr(tokenizer, 'vocab_size') and tokenizer.vocab_size > model.vocab_size:
+    if tokenizer is not None and hasattr(tokenizer, 'vocab_size') and tokenizer.vocab_size > model.vocab_size:
         print(f"Resizing token embeddings from {model.vocab_size} to {len(tokenizer)}")
         model.vocab_size = len(tokenizer)
         old_embeddings = model.token_embeddings
@@ -1216,6 +1295,10 @@ def main():
                 "num_heads": model_to_save.num_heads,
                 "head_dim": model_to_save.head_dim,
                 "max_seq_len": model_to_save.max_seq_len,
+                "mlp_ratio": getattr(model_to_save, "mlp_ratio", 4.0),
+                "mtp_enabled": getattr(model_to_save, "mtp_enabled", False),
+                "mtp_num_heads": getattr(model_to_save, "mtp_num_heads", 0),
+                "mtp_loss_weights": getattr(model_to_save, "mtp_loss_weights", [1.0, 0.7, 0.5]),
             }, save_path / "config.pt")
         print(f"\nFinal model saved to {save_path}")
         

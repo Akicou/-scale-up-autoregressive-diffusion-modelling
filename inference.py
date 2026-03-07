@@ -45,6 +45,9 @@ def load_model(checkpoint_path: str, config_path: str, device_str: str = None):
         head_dim=config.get("head_dim", 64),
         max_seq_len=config.get("max_seq_len", 8192),
         use_flash_attn=False,
+        mtp_enabled=config.get("mtp_enabled", False),
+        mtp_num_heads=config.get("mtp_num_heads", 3),
+        mtp_loss_weights=config.get("mtp_loss_weights", [1.0, 0.7, 0.5]),
     )
     
     state_dict = torch.load(checkpoint_path, map_location=device)
@@ -212,6 +215,68 @@ def complete_diffusion(input_ids: torch.Tensor, max_tokens: int, num_steps: int 
     return generated_ids, first_token_time
 
 
+def complete_medusa(input_ids: torch.Tensor, max_tokens: int, temperature: float, top_p: float, verbose: bool) -> tuple:
+    """Medusa-like decoding using base AR token plus MTP speculative tokens."""
+    generated_ids = []
+    start_time = time.time()
+    first_token_time = None
+    input_length = input_ids.shape[1]
+    max_length = min(input_length + max_tokens, model.max_seq_len)
+
+    if not getattr(model, "mtp_enabled", False):
+        return complete_ar(input_ids, max_tokens, temperature, top_p, verbose)
+
+    with torch.no_grad():
+        while input_ids.shape[1] < max_length and len(generated_ids) < max_tokens:
+            outputs = model(input_ids, use_cache=False, mode="ar")
+            ar_logits = outputs["ar_logits"]
+            mtp_logits = outputs.get("mtp_logits", [])
+
+            # Base AR next token
+            next_token_logits = ar_logits[0, -1, :] / temperature
+            if top_p < 1.0:
+                sorted_logits, sorted_indices = torch.sort(next_token_logits, descending=True)
+                cumulative_probs = torch.cumsum(torch.softmax(sorted_logits, dim=-1), dim=-1)
+                sorted_indices_to_remove = cumulative_probs > top_p
+                sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
+                sorted_indices_to_remove[..., 0] = 0
+                indices_to_remove = sorted_indices[sorted_indices_to_remove]
+                next_token_logits[indices_to_remove] = float('-inf')
+            probs = torch.softmax(next_token_logits, dim=-1)
+            candidate_tokens = [torch.multinomial(probs, num_samples=1).item()]
+
+            # Add speculative tokens from MTP heads
+            for h_logits in mtp_logits[:3]:
+                h_token_logits = h_logits[0, -1, :] / temperature
+                h_probs = torch.softmax(h_token_logits, dim=-1)
+                candidate_tokens.append(torch.multinomial(h_probs, num_samples=1).item())
+
+            accepted = 0
+            for tok in candidate_tokens:
+                if input_ids.shape[1] >= max_length or len(generated_ids) >= max_tokens:
+                    break
+                tok_tensor = torch.tensor([[tok]], device=input_ids.device, dtype=torch.long)
+                input_ids = torch.cat([input_ids, tok_tensor], dim=1)
+                generated_ids.append(tok)
+                accepted += 1
+
+                if first_token_time is None:
+                    first_token_time = time.time() - start_time
+                    if verbose:
+                        print(f"[medusa] First token at {first_token_time:.3f}s")
+
+                if tok == tokenizer.eos_token_id:
+                    break
+
+            if verbose:
+                print(f"[medusa] Accepted {accepted} token(s), total={len(generated_ids)}")
+
+            if generated_ids and generated_ids[-1] == tokenizer.eos_token_id:
+                break
+
+    return generated_ids[:max_tokens], first_token_time if first_token_time else time.time() - start_time
+
+
 def complete(prompt: str, max_tokens: int = 100, temperature: float = 1.0, top_p: float = 1.0, mode: str = "ar", verbose: bool = True) -> Dict[str, Any]:
     global model, tokenizer, device
     if model is None or tokenizer is None:
@@ -242,6 +307,10 @@ def complete(prompt: str, max_tokens: int = 100, temperature: float = 1.0, top_p
     elif mode == "reasoning":
         # Use AR for thinking phase
         generated_ids, first_token_time = complete_ar(
+            input_ids, max_tokens, temperature, top_p, verbose
+        )
+    elif mode == "medusa":
+        generated_ids, first_token_time = complete_medusa(
             input_ids, max_tokens, temperature, top_p, verbose
         )
     else:
@@ -392,7 +461,7 @@ def main():
     parser.add_argument("--max-tokens", type=int, default=100, help="Max tokens to generate")
     parser.add_argument("--temperature", type=float, default=1.0, help="Sampling temperature")
     parser.add_argument("--top-p", type=float, default=1.0, help="Nucleus sampling")
-    parser.add_argument("--mode", type=str, default="ar", choices=["ar", "diffusion", "combined", "reasoning"], help="Generation mode: ar=auto-regressive, diffusion=masked, combined=avg both, reasoning=AR then diffusion")
+    parser.add_argument("--mode", type=str, default="ar", choices=["ar", "diffusion", "combined", "reasoning", "medusa"], help="Generation mode: ar=auto-regressive, diffusion=masked, combined=avg both, reasoning=AR then diffusion, medusa=mtp speculative decoding")
     parser.add_argument("--use-tools", action="store_true", help="Enable tool calling mode")
     parser.add_argument("--max-tool-cycles", type=int, default=3, help="Max tool call cycles in tool mode")
     parser.add_argument("--quiet", action="store_true", help="Suppress verbose output")

@@ -64,7 +64,7 @@ python pretrain.py \
   --wandb-project my-pretrain
 ```
 
-### Dev Branch Changes (Diffusion + Multi-GPU)
+### Dev Branch Changes (Diffusion + Multi-GPU + MTP)
 
 The `dev` branch includes targeted fixes and training improvements:
 
@@ -75,6 +75,33 @@ The `dev` branch includes targeted fixes and training improvements:
 - Updated inference/checkpoint loading to correctly reconstruct original vocab + mask token handling
 - Added optional multi-GPU pretraining support via Hugging Face Accelerate (`--use-accelerate`)
 - Added distributed-safe logging/checkpointing/saving behavior (main process only)
+- Added optional Medusa-style MTP for AR training with 3 heads (`--mtp-enabled --mtp-num-heads 3`)
+- Added balanced default MTP per-head loss weights (`1.0,0.7,0.5`) with configurable global scaling
+- Added `medusa` inference mode for speculative multi-token AR decoding
+
+### MTP (Medusa-Style) for AR
+
+Enable 3 MTP heads (recommended balanced weights):
+
+```bash
+python pretrain.py \
+  --loss-mode ar \
+  --mtp-enabled \
+  --mtp-num-heads 3 \
+  --mtp-loss-weights 1.0,0.7,0.5 \
+  --mtp-loss-weight 1.0
+```
+
+Use Medusa-style decoding at inference:
+
+```bash
+python inference.py \
+  --checkpoint checkpoints/10m_pretrain/checkpoint-epoch0-step0/model.pt \
+  --config checkpoints/10m_pretrain/checkpoint-epoch0-step0/config.pt \
+  --prompt "Hello" \
+  --mode medusa \
+  --max-tokens 100
+```
 
 ### Multi-GPU Pretraining (Accelerate)
 
@@ -162,6 +189,7 @@ python inference.py \
 - `diffusion` - Masked token prediction (can refine outputs)
 - `combined` - Average of AR and diffusion logits
 - `reasoning` - AR for thinking, switches to diffusion after `</thinking>`
+- `medusa` - AR with MTP speculative multi-token decoding
 
 ### Phase 2: Scale Up
 

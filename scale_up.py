@@ -45,6 +45,8 @@ def _estimate_params(config: Dict[str, Any]) -> int:
     mlp_ratio = float(config.get("mlp_ratio", 4.0))
     max_seq_len = int(config.get("max_seq_len", 2048))
     base_vocab_size = int(config["base_vocab_size"])
+    mtp_enabled = bool(config.get("mtp_enabled", False))
+    mtp_num_heads = int(config.get("mtp_num_heads", 0)) if mtp_enabled else 0
 
     # DualModeModel reserves one extra mask token internally.
     effective_vocab_size = base_vocab_size + 1
@@ -68,8 +70,9 @@ def _estimate_params(config: Dict[str, Any]) -> int:
     # Heads: AR lm_head (bias=False) + diffusion dense (bias=True) + diffusion LN + diffusion decoder (bias=False)
     ar_head = hidden_size * effective_vocab_size
     diffusion_head = (hidden_size * hidden_size + hidden_size) + (2 * hidden_size) + (hidden_size * effective_vocab_size)
+    mtp_heads = mtp_num_heads * (hidden_size * effective_vocab_size)
 
-    total = token_embed + pos_embed + embed_ln + (num_layers * per_layer) + final_ln + ar_head + diffusion_head
+    total = token_embed + pos_embed + embed_ln + (num_layers * per_layer) + final_ln + ar_head + diffusion_head + mtp_heads
     return int(total)
 
 
@@ -108,6 +111,8 @@ def calculate_target_config(
             "head_dim": int(hd_val),
             "mlp_ratio": mlp_ratio,
             "max_seq_len": max_seq_len,
+            "mtp_enabled": bool(current_config.get("mtp_enabled", False)),
+            "mtp_num_heads": int(current_config.get("mtp_num_heads", 0)),
         }
 
     current_exact = _estimate_params(make_cfg(hidden_size, num_layers, num_heads))
@@ -341,13 +346,16 @@ def scale_model_width(
     
     # Create new model
     new_model = DualModeModel(
-        vocab_size=new_config["vocab_size"],
+        vocab_size=new_config.get("base_vocab_size", new_config["vocab_size"] - 1),
         hidden_size=new_config["hidden_size"],
         num_layers=new_config["num_layers"],
         num_heads=new_config["num_heads"],
         head_dim=new_config["head_dim"],
         mlp_ratio=new_config["mlp_ratio"],
         max_seq_len=new_config["max_seq_len"],
+        mtp_enabled=getattr(model, "mtp_enabled", False),
+        mtp_num_heads=getattr(model, "mtp_num_heads", 3),
+        mtp_loss_weights=getattr(model, "mtp_loss_weights", [1.0, 0.7, 0.5]),
     )
     
     with torch.no_grad():
@@ -435,6 +443,15 @@ def scale_model_width(
         )
         new_model.diffusion_head.layer_norm.weight.data = model.diffusion_head.layer_norm.weight.data.clone()
         new_model.diffusion_head.layer_norm.bias.data = model.diffusion_head.layer_norm.bias.data.clone()
+
+        # Scale MTP heads if enabled
+        if getattr(model, "mtp_enabled", False) and len(getattr(model, "mtp_heads", [])) > 0:
+            for idx, old_mtp_head in enumerate(model.mtp_heads):
+                if idx < len(new_model.mtp_heads):
+                    new_model.mtp_heads[idx].lm_head = expand_linear_layer(
+                        old_mtp_head.lm_head,
+                        new_in_features=new_config["hidden_size"],
+                    )
     
     return new_model
 
@@ -456,13 +473,16 @@ def scale_model_depth(
     
     # Create new model with more layers
     new_model = DualModeModel(
-        vocab_size=model.vocab_size,
+        vocab_size=getattr(model, "original_vocab_size", model.vocab_size - 1),
         hidden_size=model.hidden_size,
         num_layers=new_num_layers,
         num_heads=model.num_heads,
         head_dim=model.head_dim,
         mlp_ratio=mlp_ratio,
         max_seq_len=model.max_seq_len,
+        mtp_enabled=getattr(model, "mtp_enabled", False),
+        mtp_num_heads=getattr(model, "mtp_num_heads", 3),
+        mtp_loss_weights=getattr(model, "mtp_loss_weights", [1.0, 0.7, 0.5]),
     )
     
     with torch.no_grad():
@@ -527,6 +547,14 @@ def scale_model_depth(
         new_model.diffusion_head.decoder.weight.data = model.diffusion_head.decoder.weight.data.clone()
         if model.diffusion_head.decoder.bias is not None:
             new_model.diffusion_head.decoder.bias.data = model.diffusion_head.decoder.bias.data.clone()
+
+        # Copy MTP heads if enabled
+        if getattr(model, "mtp_enabled", False) and len(getattr(model, "mtp_heads", [])) > 0:
+            for idx, old_mtp_head in enumerate(model.mtp_heads):
+                if idx < len(new_model.mtp_heads):
+                    new_model.mtp_heads[idx].lm_head.weight.data = old_mtp_head.lm_head.weight.data.clone()
+                    if old_mtp_head.lm_head.bias is not None and new_model.mtp_heads[idx].lm_head.bias is not None:
+                        new_model.mtp_heads[idx].lm_head.bias.data = old_mtp_head.lm_head.bias.data.clone()
     
     return new_model
 
@@ -567,12 +595,16 @@ def scale_model(
     
     # Create model from config
     model = DualModeModel(
-        vocab_size=config.get("vocab_size", 16000),
+        vocab_size=config.get("original_vocab_size", config.get("vocab_size", 16000) - 1),
         hidden_size=config.get("hidden_size", 256),
         num_layers=config.get("num_layers", 6),
         num_heads=config.get("num_heads", 4),
         head_dim=config.get("head_dim", 64),
+        mlp_ratio=config.get("mlp_ratio", 4.0),
         max_seq_len=config.get("max_seq_len", 8192),
+        mtp_enabled=config.get("mtp_enabled", False),
+        mtp_num_heads=config.get("mtp_num_heads", 3),
+        mtp_loss_weights=config.get("mtp_loss_weights", [1.0, 0.7, 0.5]),
     )
     model.load_state_dict(state_dict)
     
@@ -594,6 +626,9 @@ def scale_model(
         "head_dim": model.head_dim,
         "mlp_ratio": inferred_mlp_ratio,
         "max_seq_len": model.max_seq_len,
+        "mtp_enabled": getattr(model, "mtp_enabled", False),
+        "mtp_num_heads": getattr(model, "mtp_num_heads", 3),
+        "mtp_loss_weights": getattr(model, "mtp_loss_weights", [1.0, 0.7, 0.5]),
     }
     
     print(f"Current config: {current_config}")
@@ -641,6 +676,9 @@ def scale_model(
         "actual_scaled_parameters": scaled_model.get_num_params(),
         "current_config": current_config,
         "target_config": target_config,
+        "mtp_enabled": getattr(scaled_model, "mtp_enabled", False),
+        "mtp_num_heads": getattr(scaled_model, "mtp_num_heads", 0),
+        "mtp_loss_weights": getattr(scaled_model, "mtp_loss_weights", [1.0, 0.7, 0.5]),
     }
     torch.save(scaling_config, Path(output_path) / "config.pt")
     
