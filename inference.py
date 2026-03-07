@@ -53,12 +53,24 @@ def complete(prompt: str, max_tokens: int = 100, temperature: float = 1.0, top_p
         print(f"[{mode}] Input tokens: {input_length}")
     with torch.no_grad():
         for i in range(max_length - input_length):
-            outputs = model(input_ids, use_cache=False, mode=mode)
-            # Get logits based on mode
+            # For reasoning mode: use AR for thinking, then switch to diffusion after </thinking>
+            current_mode = mode
+            if mode == "reasoning":
+                # Check if we've generated </thinking>
+                if len(generated_ids) > 0:
+                    # Decode what we have so far
+                    generated_text_so_far = tokenizer.decode(generated_ids, skip_special_tokens=False)
+                    if "</thinking>" in generated_text_so_far:
+                        current_mode = "diffusion"  # Switch to diffusion for final answer
+                        if verbose:
+                            print(f"[reasoning] Switched to diffusion for final answer")
+            
+            outputs = model(input_ids, use_cache=False, mode=current_mode)
+            # Get logits based on current mode
             ar_logits = outputs.get("ar_logits")
             diffusion_logits = outputs.get("diffusion_logits")
             
-            if mode == "combined" or mode == "reasoning":
+            if mode == "combined" or (mode == "reasoning" and current_mode == "combined"):
                 # Average logits from both modes
                 if ar_logits is not None and diffusion_logits is not None:
                     logits = (ar_logits + diffusion_logits) / 2
