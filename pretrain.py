@@ -622,7 +622,7 @@ class DualModeModel(nn.Module):
 class BinaryDataset(Dataset):
     """Dataset for binary token files."""
     
-    def __init__(self, file_path: str, seq_len: int = 512):
+    def __init__(self, file_path: str, seq_len: int = 512, max_samples: Optional[int] = None):
         self.file_path = file_path
         self.seq_len = seq_len
         
@@ -635,6 +635,8 @@ class BinaryDataset(Dataset):
             self.data = np.random.randint(0, 32000, size=(100000,), dtype=np.uint16)
         
         self.num_samples = len(self.data) // seq_len
+        if max_samples is not None:
+            self.num_samples = min(self.num_samples, max_samples)
     
     def __len__(self) -> int:
         return self.num_samples
@@ -649,7 +651,7 @@ class BinaryDataset(Dataset):
 class TextDataset(Dataset):
     """Dataset for text files with on-the-fly tokenization."""
     
-    def __init__(self, file_path: str, tokenizer, seq_len: int = 512):
+    def __init__(self, file_path: str, tokenizer, seq_len: int = 512, max_samples: Optional[int] = None):
         self.file_path = file_path
         self.tokenizer = tokenizer
         self.seq_len = seq_len
@@ -661,6 +663,9 @@ class TextDataset(Dataset):
         else:
             print(f"Warning: {file_path} not found. Using dummy data.")
             self.texts = ["This is a sample text for training." * 10] * 1000
+
+        if max_samples is not None:
+            self.texts = self.texts[:max_samples]
     
     def __len__(self) -> int:
         return len(self.texts)
@@ -801,6 +806,8 @@ class TrainingConfig:
     log_interval: int = 10
     eval_interval: int = 1000
     max_seq_len: int = 512
+    max_train_steps: Optional[int] = None
+    max_samples: Optional[int] = 10000
     
     # Model config
     vocab_size: int = 32000
@@ -851,7 +858,8 @@ def train_epoch(
     config: TrainingConfig,
     epoch: int,
     accelerator=None,
-) -> dict:
+    start_global_step: int = 0,
+) -> Tuple[dict, int, bool]:
     """Train for one epoch."""
     model.train()
     
@@ -864,6 +872,8 @@ def train_epoch(
     is_main_process = accelerator is None or accelerator.is_main_process
     pbar = tqdm(dataloader, desc=f"Epoch {epoch}", disable=not is_main_process)
     optimizer.zero_grad()
+    global_step = start_global_step
+    stop_training = False
     
     for batch_idx, batch in enumerate(pbar):
         if accelerator is None:
@@ -907,6 +917,9 @@ def train_epoch(
             optimizer.zero_grad()
             if scheduler is not None:
                 scheduler.step()
+            global_step += 1
+            if config.max_train_steps is not None and global_step >= config.max_train_steps:
+                stop_training = True
         
         # Logging
         loss_value = loss.item() * config.accumulation_steps
@@ -947,8 +960,11 @@ def train_epoch(
                     "train/diffusion_loss": total_diffusion_loss / max(1, num_batches),
                     "train/mtp_loss": total_mtp_loss / max(1, num_batches),
                     "train/lr": optimizer.param_groups[0]["lr"],
-                    "train/step": epoch * len(dataloader) + batch_idx,
+                    "train/step": global_step,
                 })
+
+        if stop_training:
+            break
     
     denom = max(1, num_batches)
     return {
@@ -956,7 +972,7 @@ def train_epoch(
         "ar_loss": total_ar_loss / denom if total_ar_loss > 0 else None,
         "diffusion_loss": total_diffusion_loss / denom if total_diffusion_loss > 0 else None,
         "mtp_loss": total_mtp_loss / denom if total_mtp_loss > 0 else None,
-    }
+    }, global_step, stop_training
 
 
 def evaluate(model: nn.Module, dataloader: DataLoader, config: TrainingConfig, accelerator=None) -> dict:
@@ -1053,6 +1069,8 @@ def main():
     
     # Training arguments
     parser.add_argument("--epochs", type=int, default=3, help="Number of epochs")
+    parser.add_argument("--max-train-steps", type=int, default=None, help="Hard cap on optimizer update steps")
+    parser.add_argument("--max-samples", type=int, default=10000, help="Maximum number of dataset samples to load/use")
     parser.add_argument("--batch-size", type=int, default=8, help="Batch size (smaller for long sequences)")
     parser.add_argument("--gradient-checkpointing", action="store_true", help="Enable gradient checkpointing to save memory")
     parser.add_argument("--lr", type=float, default=1e-4, help="Learning rate")
@@ -1104,6 +1122,8 @@ def main():
         log_interval=args.log_interval,
         eval_interval=args.eval_interval,
         max_seq_len=args.seq_len,
+        max_train_steps=args.max_train_steps,
+        max_samples=args.max_samples,
         vocab_size=args.vocab_size,
         hidden_size=args.hidden_size,
         num_layers=args.num_layers,
@@ -1208,14 +1228,15 @@ def main():
             split="en",  # Ultra-FineWeb uses 'en' or 'zh' splits
             seq_len=config.max_seq_len,
             tokenizer=tokenizer,
+            max_samples=config.max_samples,
         )
     elif config.data_path.endswith(".txt"):
         # Text file
         tokenizer = get_default_tokenizer()
-        train_dataset = TextDataset(config.data_path, tokenizer, config.max_seq_len)
+        train_dataset = TextDataset(config.data_path, tokenizer, config.max_seq_len, max_samples=config.max_samples)
     else:
         # Binary token file
-        train_dataset = BinaryDataset(config.data_path, config.max_seq_len)
+        train_dataset = BinaryDataset(config.data_path, config.max_seq_len, max_samples=config.max_samples)
     
     train_loader = DataLoader(
         train_dataset, 
@@ -1234,12 +1255,13 @@ def main():
                 split="zh",
                 seq_len=config.max_seq_len,
                 tokenizer=tokenizer,
+                max_samples=config.max_samples,
             )
         elif config.val_data_path.endswith(".txt"):
             tokenizer = get_default_tokenizer()
-            val_dataset = TextDataset(config.val_data_path, tokenizer, config.max_seq_len)
+            val_dataset = TextDataset(config.val_data_path, tokenizer, config.max_seq_len, max_samples=config.max_samples)
         else:
-            val_dataset = BinaryDataset(config.val_data_path, config.max_seq_len)
+            val_dataset = BinaryDataset(config.val_data_path, config.max_seq_len, max_samples=config.max_samples)
         
         val_loader = DataLoader(
             val_dataset, 
@@ -1260,7 +1282,8 @@ def main():
             model, optimizer, train_loader = accelerator.prepare(model, optimizer, train_loader)
     
     # Create scheduler
-    num_training_steps = len(train_loader) * config.epochs // config.accumulation_steps
+    estimated_steps = len(train_loader) * config.epochs // config.accumulation_steps
+    num_training_steps = config.max_train_steps if config.max_train_steps is not None else estimated_steps
     scheduler = get_linear_schedule_with_warmup(optimizer, config.warmup_steps, num_training_steps)
     
     # Training loop
@@ -1269,7 +1292,16 @@ def main():
     global_step = 0
     
     for epoch in range(config.epochs):
-        train_metrics = train_epoch(model, train_loader, optimizer, scheduler, config, epoch, accelerator=accelerator)
+        train_metrics, global_step, stop_training = train_epoch(
+            model,
+            train_loader,
+            optimizer,
+            scheduler,
+            config,
+            epoch,
+            accelerator=accelerator,
+            start_global_step=global_step,
+        )
         if accelerator is None or accelerator.is_main_process:
             print(f"Epoch {epoch}: {train_metrics}")
         
@@ -1284,8 +1316,11 @@ def main():
                 
                 if config.wandb_project and HAS_WANDB:
                     wandb.log({"eval/loss": eval_metrics["loss"]})
-        
-        global_step += len(train_loader)
+
+        if stop_training:
+            if accelerator is None or accelerator.is_main_process:
+                print(f"Reached max_train_steps={config.max_train_steps}, stopping training.")
+            break
     
     # Final save
     if accelerator is None or accelerator.is_main_process:
