@@ -411,27 +411,30 @@ def scale_model(
     """
     print(f"\n=== Loading Model from {input_path} ===")
     
-    # Load model
-    try:
-        model = DualModeModel.from_pretrained(input_path)
-    except Exception as e:
-        print(f"Failed to load from pretrained: {e}")
-        print("Creating model from config...")
-        # Try loading config
-        config_path = Path(input_path) / "config.json"
-        if config_path.exists():
-            with open(config_path) as f:
-                config = json.load(f)
-            model = DualModeModel(**config)
-            # Load weights
-            weights_path = Path(input_path) / "model.safetensors"
-            if not weights_path.exists():
-                weights_path = Path(input_path) / "pytorch_model.bin"
-            if weights_path.exists():
-                state_dict = torch.load(weights_path, map_location="cpu")
-                model.load_state_dict(state_dict, strict=False)
-        else:
-            raise ValueError(f"Cannot load model from {input_path}")
+    input_path = Path(input_path)
+    
+    # Load config
+    config_path = input_path / "config.pt"
+    model_path = input_path / "model.pt"
+    
+    if not config_path.exists() or not model_path.exists():
+        raise ValueError(f"Cannot load model from {input_path}. Expected config.pt and model.pt files.")
+    
+    config = torch.load(config_path, map_location="cpu")
+    state_dict = torch.load(model_path, map_location="cpu")
+    
+    # Create model from config
+    model = DualModeModel(
+        vocab_size=config.get("vocab_size", 16000),
+        hidden_size=config.get("hidden_size", 256),
+        num_layers=config.get("num_layers", 6),
+        num_heads=config.get("num_heads", 4),
+        head_dim=config.get("head_dim", 64),
+        max_seq_len=config.get("max_seq_len", 8192),
+    )
+    model.load_state_dict(state_dict)
+    
+    print(f"Loaded model from {input_path}")
     
     # Get current config
     current_config = {
@@ -472,11 +475,13 @@ def scale_model(
     # Save model
     print(f"\n=== Saving Model to {output_path} ===")
     os.makedirs(output_path, exist_ok=True)
-    scaled_model.save_pretrained(output_path)
     
-    # Save scaling config
+    # Save model state dict
+    torch.save(scaled_model.state_dict(), Path(output_path) / "model.pt")
+    
+    # Save config
     scaling_config = {
-        "input_path": input_path,
+        "input_path": str(input_path),
         "output_path": output_path,
         "method": method,
         "interpolate_pos_embeddings": interpolate_pos,
@@ -484,12 +489,10 @@ def scale_model(
         "current_config": current_config,
         "target_config": target_config,
     }
-    
-    with open(Path(output_path) / "scaling_config.json", "w") as f:
-        json.dump(scaling_config, f, indent=2)
+    torch.save(scaling_config, Path(output_path) / "config.pt")
     
     print(f"\nScaled model saved to {output_path}")
-    print(f"Scaling config saved to {Path(output_path) / 'scaling_config.json'}")
+    print(f"Config saved to {Path(output_path) / 'config.pt'}")
     
     return scaled_model
 

@@ -4,13 +4,26 @@
 import argparse
 import time
 import torch
-from typing import Dict, Any
+from typing import Dict, Any, List, Optional
+import json
 
 from pretrain import DualModeModel, get_default_tokenizer
+from tools import ToolRegistry, ToolCallParser, detect_tool_calls, parse_tool_result
+from tools.registry import get_default_registry
 
 model = None
 tokenizer = None
 device = None
+tool_registry = None
+tool_parser = None
+
+
+def init_tools():
+    """Initialize tool registry and parser."""
+    global tool_registry, tool_parser
+    tool_registry = get_default_registry()
+    tool_parser = ToolCallParser()
+    print(f"Initialized {len(tool_registry.list_tools())} tools: {tool_registry.list_tools()}")
 
 
 def load_model(checkpoint_path: str, config_path: str, device_str: str = None):
@@ -136,6 +149,130 @@ def complete(prompt: str, max_tokens: int = 100, temperature: float = 1.0, top_p
     return {"text": generated_text, "ttft": ttft, "tps": tps, "total_tokens": len(generated_ids), "finish_reason": "stop" if generated_ids else "length"}
 
 
+def complete_with_tools(
+    prompt: str,
+    max_tokens: int = 100,
+    temperature: float = 1.0,
+    top_p: float = 1.0,
+    mode: str = "ar",
+    max_tool_cycles: int = 3,
+    verbose: bool = True
+) -> Dict[str, Any]:
+    """
+    Generate completion with tool calling support.
+    
+    Args:
+        prompt: Input prompt
+        max_tokens: Max tokens to generate
+        temperature: Sampling temperature
+        top_p: Nucleus sampling parameter
+        mode: Generation mode (ar, diffusion, combined, reasoning)
+        max_tool_cycles: Maximum number of tool call cycles
+        verbose: Print verbose output
+    
+    Returns:
+        Dict with text, tool_calls, and metadata
+    """
+    global model, tokenizer, device, tool_registry, tool_parser
+    
+    if model is None or tokenizer is None:
+        raise RuntimeError("Model not loaded. Call load_model() first.")
+    
+    if tool_registry is None or tool_parser is None:
+        init_tools()
+    
+    # Add tool schemas to prompt if tools are available
+    tool_schemas = tool_registry.get_schemas_text() if tool_registry else ""
+    
+    # Build the full prompt with tool instructions
+    full_prompt = prompt
+    if tool_schemas:
+        full_prompt = f"{prompt}\n\nAvailable tools:\n{tool_schemas}\n\nWhen you need to use a tool, output the tool call in JSON format: {{\"tool\": \"tool_name\", \"args\": {{...}}}}"
+    
+    tool_calls_executed = []
+    current_prompt = full_prompt
+    
+    for cycle in range(max_tool_cycles):
+        if verbose:
+            print(f"\n=== Tool Cycle {cycle + 1} ===")
+        
+        # Generate completion
+        result = complete(
+            current_prompt,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            top_p=top_p,
+            mode=mode,
+            verbose=verbose
+        )
+        
+        generated_text = result["text"]
+        
+        # Check for tool calls in the output
+        tool_calls = tool_parser.parse(generated_text)
+        
+        if not tool_calls:
+            if verbose:
+                print(f"[complete_with_tools] No tool calls detected, returning result")
+            return {
+                "text": generated_text,
+                "tool_calls": tool_calls_executed,
+                "cycles": cycle + 1,
+                "final": True
+            }
+        
+        # Execute tool calls
+        if verbose:
+            print(f"[complete_with_tools] Executing {len(tool_calls)} tool call(s)")
+        
+        for tc in tool_calls:
+            if verbose:
+                print(f"[complete_with_tools] Tool: {tc.tool_name}, args: {tc.arguments}")
+            
+            try:
+                tool_result = tool_registry.execute(tc.tool_name, tc.arguments)
+                tool_calls_executed.append({
+                    "tool": tc.tool_name,
+                    "args": tc.arguments,
+                    "result": tool_result,
+                    "success": True
+                })
+                
+                if verbose:
+                    print(f"[complete_with_tools] Result: {tool_result}")
+                    
+            except Exception as e:
+                error_msg = str(e)
+                tool_calls_executed.append({
+                    "tool": tc.tool_name,
+                    "args": tc.arguments,
+                    "error": error_msg,
+                    "success": False
+                })
+                
+                if verbose:
+                    print(f"[complete_with_tools] Error: {error_msg}")
+        
+        # Format tool results for the model
+        tool_results_text = "\n\n".join([
+            f"Tool '{tc['tool']}' result: {json.dumps(tc.get('result', tc.get('error')))}"
+            for tc in tool_calls_executed[-len(tool_calls):]
+        ])
+        
+        # Feed results back to model for final answer
+        current_prompt = f"{current_prompt}\n\n{generated_text}\n\n{tool_results_text}\n\nBased on the tool results, provide your final answer:"
+        max_tokens = max_tokens // 2  # Reduce tokens for subsequent cycles
+    
+    # Return after max cycles
+    return {
+        "text": generated_text,
+        "tool_calls": tool_calls_executed,
+        "cycles": max_tool_cycles,
+        "final": False,
+        "reason": "max_cycles"
+    }
+
+
 def main():
     parser = argparse.ArgumentParser(description="Run inference")
     parser.add_argument("--checkpoint", type=str, required=True, help="Path to model .pt file")
@@ -145,14 +282,37 @@ def main():
     parser.add_argument("--temperature", type=float, default=1.0, help="Sampling temperature")
     parser.add_argument("--top-p", type=float, default=1.0, help="Nucleus sampling")
     parser.add_argument("--mode", type=str, default="ar", choices=["ar", "diffusion", "combined", "reasoning"], help="Generation mode: ar=auto-regressive, diffusion=masked, combined=avg both, reasoning=AR then diffusion")
+    parser.add_argument("--use-tools", action="store_true", help="Enable tool calling mode")
+    parser.add_argument("--max-tool-cycles", type=int, default=3, help="Max tool call cycles in tool mode")
     parser.add_argument("--quiet", action="store_true", help="Suppress verbose output")
     args = parser.parse_args()
     
     load_model(args.checkpoint, args.config)
-    result = complete(args.prompt, args.max_tokens, args.temperature, args.top_p, args.mode, verbose=not args.quiet)
-    print(f"\n=== RESULT ===")
-    print(f"Text: {result['text']}")
-    print(f"TTFT: {result['ttft']:.3f}s, TPS: {result['tps']:.2f}, Tokens: {result['total_tokens']}")
+    
+    if args.use_tools:
+        result = complete_with_tools(
+            args.prompt,
+            args.max_tokens,
+            args.temperature,
+            args.top_p,
+            args.mode,
+            args.max_tool_cycles,
+            verbose=not args.quiet
+        )
+        print(f"\n=== RESULT (with tools) ===")
+        print(f"Text: {result['text']}")
+        print(f"Tool calls executed: {len(result.get('tool_calls', []))}")
+        print(f"Cycles: {result.get('cycles', 1)}")
+        if result.get('tool_calls'):
+            print("Tool call details:")
+            for tc in result['tool_calls']:
+                status = "success" if tc.get('success') else f"error: {tc.get('error')}"
+                print(f"  - {tc['tool']}({tc['args']}): {status}")
+    else:
+        result = complete(args.prompt, args.max_tokens, args.temperature, args.top_p, args.mode, verbose=not args.quiet)
+        print(f"\n=== RESULT ===")
+        print(f"Text: {result['text']}")
+        print(f"TTFT: {result['ttft']:.3f}s, TPS: {result['tps']:.2f}, Tokens: {result['total_tokens']}")
 
 
 if __name__ == "__main__":

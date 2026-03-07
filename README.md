@@ -109,6 +109,48 @@ python scale_up.py \
   --interpolate-pos-embeddings linear
 ```
 
+### Phase 2b: Extend Context Length
+
+Extend the context window from 8K to 32K, 64K, or longer using YaRN (Yet Another RoPE Extension).
+
+```bash
+# Extend from 8K to 64K context
+python extend_context.py \
+  --checkpoint ./checkpoints/4b_scaled/model.pt \
+  --config ./checkpoints/4b_scaled/config.pt \
+  --output ./checkpoints/4b_64k/model.pt \
+  --target-context 65536 \
+  --base-context 8192 \
+  --method yarn
+```
+
+**Available context extensions:**
+
+| Base | Target | RoPE Scale | RoPE Factor |
+|------|--------|------------|-------------|
+| 8K   | 16K    | 0.5        | 1.0         |
+| 8K   | 32K    | 0.25       | 2.0         |
+| 8K   | 64K    | 0.125      | 4.0         |
+| 16K  | 32K    | 0.5        | 1.0         |
+| 16K  | 64K    | 0.25       | 2.0         |
+| 32K  | 64K    | 0.5        | 1.0         |
+
+**Apply YaRN to a running model:**
+
+```python
+from extend_context import apply_yarn_to_model
+
+# Apply YaRN to extend context to 64K
+apply_yarn_to_model(model, target_context=65536, base_context=8192)
+
+# Now model can handle sequences up to 64K tokens
+output = model.generate(prompt, max_length=50000)
+```
+
+**How YaRN works:**
+- **RoPE Scale** (rope_scale): Interpolates position embeddings to reduce their "frequency", allowing the model to represent more positions
+- **RoPE Factor** (rope_factor): Scales attention logits to compensate for the dilution effect of interpolation on long-range dependencies
+
 ### Phase 3: SFT Finetuning
 
 ```bash
