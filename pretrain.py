@@ -298,20 +298,26 @@ class DualModeModel(nn.Module):
         use_cache: bool = False,
         use_flash_attn: bool = False,
         gradient_checkpointing: bool = False,
+        diffusion_mask_prob: float = 0.15,  # Probability of masking tokens for diffusion training
     ):
         super().__init__()
         self.gradient_checkpointing = gradient_checkpointing
         
-        self.vocab_size = vocab_size
+        # Reserve last token ID for mask token (used in diffusion training)
+        self.vocab_size = vocab_size + 1  # Add 1 for mask token
+        self.original_vocab_size = vocab_size  # Original vocab without mask token
+        self.mask_token_id = vocab_size  # Mask token is at index vocab_size (last before +1)
+        
         self.hidden_size = hidden_size
         self.num_layers = num_layers
         self.num_heads = num_heads
         self.head_dim = head_dim
         self.max_seq_len = max_seq_len
         self.use_flash_attn = use_flash_attn and HAS_FLASH_ATTN
+        self.diffusion_mask_prob = diffusion_mask_prob
         
-        # Embeddings
-        self.token_embeddings = nn.Embedding(vocab_size, hidden_size)
+        # Embeddings - use vocab_size + 1 to include mask token
+        self.token_embeddings = nn.Embedding(self.vocab_size, hidden_size)
         # Position embeddings - use smaller base since RoPE handles extrapolation
         # For long context (256K), use 8192 as base and interpolate
         base_pos_len = min(max_seq_len, 8192)
@@ -366,6 +372,7 @@ class DualModeModel(nn.Module):
         use_cache: bool = False,
         past_key_values: Optional[List[Tuple[torch.Tensor, torch.Tensor]]] = None,
         mode: str = "both",
+        is_training: bool = False,
     ) -> dict:
         """
         Forward pass supporting both AR and diffusion modes.
@@ -377,6 +384,7 @@ class DualModeModel(nn.Module):
             use_cache: Whether to use KV caching
             past_key_values: Past KV cache
             mode: "ar", "diffusion", or "both"
+            is_training: Whether in training mode (for diffusion noising)
         
         Returns:
             Dictionary with losses and logits
@@ -386,6 +394,24 @@ class DualModeModel(nn.Module):
         # Clamp input_ids to vocab_size to avoid index out of bounds
         input_ids = input_ids.clamp(0, self.vocab_size - 1)
         
+        # Store original input for diffusion loss computation
+        original_input_ids = input_ids.clone()
+        
+        # For diffusion training: add noise by randomly masking tokens
+        masked_positions = None
+        if mode in ("diffusion", "both") and is_training and labels is not None:
+            # Randomly mask tokens with probability diffusion_mask_prob
+            noise_mask = torch.rand(input_ids.shape, device=input_ids.device) < self.diffusion_mask_prob
+            # Don't mask the last token (need at least some context)
+            noise_mask[:, -1] = False
+            
+            # Replace masked positions with mask token
+            input_ids = input_ids.clone()
+            input_ids[noise_mask] = self.mask_token_id
+            
+            # Store masked positions for loss computation
+            masked_positions = noise_mask
+        
         # Embeddings - always wrap position_ids with modulo to handle any seq_len
         position_ids = torch.arange(seq_len, device=input_ids.device).unsqueeze(0).expand(batch_size, -1)
         # Wrap position IDs using modulo (position embeddings are smaller than seq_len)
@@ -393,11 +419,16 @@ class DualModeModel(nn.Module):
         hidden_states = self.token_embeddings(input_ids) + self.position_embeddings(position_ids)
         hidden_states = self.embed_layernorm(hidden_states)
         
-        # Create attention mask for causal attention
-        if attention_mask is None:
-            # Create causal mask
-            attention_mask = torch.full((seq_len, seq_len), float("-inf"), device=input_ids.device)
-            attention_mask = torch.triu(attention_mask, diagonal=1).unsqueeze(0).unsqueeze(0)
+        # Create attention mask based on mode
+        if mode == "diffusion":
+            # Bidirectional attention for diffusion (can see all tokens)
+            attention_mask = None  # No causal masking needed
+        elif mode == "ar" or mode == "both":
+            # Causal attention for AR mode
+            if attention_mask is None:
+                # Create causal mask
+                attention_mask = torch.full((seq_len, seq_len), float("-inf"), device=input_ids.device)
+                attention_mask = torch.triu(attention_mask, diagonal=1).unsqueeze(0).unsqueeze(0)
         
         # Transformer layers
         present = None
@@ -437,10 +468,24 @@ class DualModeModel(nn.Module):
             outputs["diffusion_logits"] = diffusion_logits
             
             if labels is not None:
-                # Clamp labels to vocab_size range
-                clamped_labels = labels.clamp(0, self.vocab_size - 1)
-                loss_fct = nn.CrossEntropyLoss(ignore_index=-100)
-                diffusion_loss = loss_fct(diffusion_logits.view(-1, self.vocab_size), clamped_labels.view(-1))
+                # For diffusion: only compute loss on MASKED positions (denoising objective)
+                # The labels should be the original (unmasked) tokens
+                clamped_labels = original_input_ids.clamp(0, self.original_vocab_size - 1)
+                
+                if masked_positions is not None:
+                    # Only compute loss on masked positions
+                    # Set non-masked positions to ignore_index (-100)
+                    loss_labels = clamped_labels.clone()
+                    loss_labels[~masked_positions] = -100
+                    
+                    loss_fct = nn.CrossEntropyLoss(ignore_index=-100)
+                    diffusion_loss = loss_fct(diffusion_logits.view(-1, self.vocab_size), loss_labels.view(-1))
+                else:
+                    # No masking applied (inference or eval mode) - compute loss on all tokens
+                    clamped_labels = clamped_labels.clamp(0, self.original_vocab_size - 1)
+                    loss_fct = nn.CrossEntropyLoss(ignore_index=-100)
+                    diffusion_loss = loss_fct(diffusion_logits.view(-1, self.vocab_size), clamped_labels.view(-1))
+                
                 outputs["diffusion_loss"] = diffusion_loss
         
         if use_cache:
@@ -489,7 +534,7 @@ class DualModeModel(nn.Module):
         device = input_ids.device
         
         # Start with all tokens masked
-        masked_input = torch.full((batch_size, seq_len), self.vocab_size - 1, dtype=torch.long, device=device)
+        masked_input = torch.full((batch_size, seq_len), self.mask_token_id, dtype=torch.long, device=device)
         
         # Gradually unmask tokens
         num_masked = seq_len
@@ -507,7 +552,7 @@ class DualModeModel(nn.Module):
             # Update masked positions
             for b in range(batch_size):
                 for i in range(seq_len):
-                    if masked_input[b, i] == self.vocab_size - 1:
+                    if masked_input[b, i] == self.mask_token_id:
                         if num_to_unmask > 0:
                             masked_input[b, i] = predictions[b, i]
                             num_to_unmask -= 1
@@ -762,7 +807,7 @@ def train_epoch(
         batch = batch.to(config.device)
         
         # Forward pass
-        outputs = model(batch, labels=batch, mode=config.loss_mode)
+        outputs = model(batch, labels=batch, mode=config.loss_mode, is_training=True)
         
         # Compute loss
         if config.loss_mode == "both":
@@ -830,7 +875,7 @@ def evaluate(model: nn.Module, dataloader: DataLoader, config: TrainingConfig) -
     with torch.no_grad():
         for batch in tqdm(dataloader, desc="Evaluating"):
             batch = batch.to(config.device)
-            outputs = model(batch, labels=batch, mode=config.loss_mode)
+            outputs = model(batch, labels=batch, mode=config.loss_mode, is_training=False)
             
             if config.loss_mode == "both":
                 loss = config.ar_loss_weight * outputs.get("ar_loss", 0) + \
@@ -860,6 +905,8 @@ def save_checkpoint(model: nn.Module, optimizer: torch.optim.Optimizer, schedule
     # Save model config
     config_dict = {
         "vocab_size": model.vocab_size,
+        "original_vocab_size": model.original_vocab_size,
+        "mask_token_id": model.mask_token_id,
         "hidden_size": model.hidden_size,
         "num_layers": model.num_layers,
         "num_heads": model.num_heads,

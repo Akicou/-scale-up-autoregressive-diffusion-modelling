@@ -38,7 +38,7 @@ def load_model(checkpoint_path: str, config_path: str, device_str: str = None):
     print(f"Using device: {device}")
     
     model = DualModeModel(
-        vocab_size=config.get("vocab_size", 16000),
+        vocab_size=config.get("original_vocab_size", config.get("vocab_size", 16000) - 1),
         hidden_size=config.get("hidden_size", 256),
         num_layers=config.get("num_layers", 6),
         num_heads=config.get("num_heads", 4),
@@ -132,7 +132,7 @@ def complete_diffusion(input_ids: torch.Tensor, max_tokens: int, num_steps: int 
     device = input_ids.device
     
     # Create fixed-size sequence with prompt + [MASK] for generation space
-    mask_token_id = tokenizer.pad_token_id if tokenizer.pad_token_id else 0
+    mask_token_id = model.mask_token_id if hasattr(model, "mask_token_id") else (tokenizer.pad_token_id if tokenizer.pad_token_id else 0)
     generation_seq = torch.full((batch_size, input_length + max_tokens), mask_token_id, dtype=torch.long, device=device)
     generation_seq[:, :input_length] = input_ids
     

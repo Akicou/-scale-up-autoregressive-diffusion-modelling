@@ -64,6 +64,49 @@ python pretrain.py \
   --wandb-project my-pretrain
 ```
 
+### Dev Branch Changes (Diffusion Training Fixes)
+
+The `dev` branch includes targeted fixes to make diffusion training behavior consistent with masked-denoising training:
+
+- Added a dedicated mask token in model vocabulary (`mask_token_id`) and persisted it in checkpoint config
+- Added diffusion noising during training via random token masking (`diffusion_mask_prob`)
+- Changed diffusion loss to train only on masked positions (non-masked positions are ignored)
+- Kept AR training causal while diffusion mode uses bidirectional context behavior
+- Updated inference/checkpoint loading to correctly reconstruct original vocab + mask token handling
+
+### Recommended Training Profiles (10M / 50M / 150M)
+
+Use these as starting points for `pretrain.py`:
+
+| Target Params | Suggested Core Args |
+|---|---|
+| ~10M | `--hidden-size 256 --num-layers 6 --num-heads 4 --head-dim 64 --batch-size 64 --seq-len 512 --lr 1e-4 --warmup-steps 200 --loss-mode both --gradient-checkpointing` |
+| ~50M | `--hidden-size 512 --num-layers 10 --num-heads 8 --head-dim 64 --batch-size 32 --seq-len 1024 --lr 1e-4 --warmup-steps 500 --loss-mode both --gradient-checkpointing --accumulation-steps 2` |
+| ~150M | `--hidden-size 768 --num-layers 14 --num-heads 12 --head-dim 64 --batch-size 16 --seq-len 1024 --lr 8e-5 --warmup-steps 1000 --loss-mode both --gradient-checkpointing --accumulation-steps 4` |
+
+### Recommended Data Scale by Model Size
+
+Scale dataset size with model size to avoid undertraining:
+
+| Target Params | Recommended Training Tokens | Practical Dataset Size (approx.) |
+|---|---:|---:|
+| ~10M | 1B–3B tokens | 4–12 GB cleaned text |
+| ~50M | 5B–15B tokens | 20–60 GB cleaned text |
+| ~150M | 15B–40B tokens | 60–160 GB cleaned text |
+
+Example invocations:
+
+```bash
+# ~10M profile
+python pretrain.py --hidden-size 256 --num-layers 6 --num-heads 4 --head-dim 64 --batch-size 64 --seq-len 512 --lr 1e-4 --warmup-steps 200 --loss-mode both --gradient-checkpointing
+
+# ~50M profile
+python pretrain.py --hidden-size 512 --num-layers 10 --num-heads 8 --head-dim 64 --batch-size 32 --seq-len 1024 --lr 1e-4 --warmup-steps 500 --loss-mode both --gradient-checkpointing --accumulation-steps 2
+
+# ~150M profile
+python pretrain.py --hidden-size 768 --num-layers 14 --num-heads 12 --head-dim 64 --batch-size 16 --seq-len 1024 --lr 8e-5 --warmup-steps 1000 --loss-mode both --gradient-checkpointing --accumulation-steps 4
+```
+
 ### Inference
 
 ```bash
