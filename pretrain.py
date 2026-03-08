@@ -72,6 +72,15 @@ except ImportError:
     flash_attn_func = None
     HAS_FLASH_ATTN = False
 
+# Import architecture utilities
+try:
+    from utils.architecture import config_from_params, estimate_params
+    HAS_ARCH_UTILS = True
+except ImportError:
+    HAS_ARCH_UTILS = False
+    config_from_params = None
+    estimate_params = None
+
 
 # ============================================================================
 # Model Components
@@ -1090,6 +1099,8 @@ def main():
     parser.add_argument("--seq-len", type=int, default=512, help="Sequence length")
     
     # Model arguments - defaults for ~10M model
+    parser.add_argument("--target-parameters", type=int, default=None, help="Target parameter count (auto-calculates architecture)")
+    parser.add_argument("--base-profile", type=str, default="small", choices=["tiny", "small", "medium", "large", "xl"], help="Base profile for auto-calculation (used with --target-parameters)")
     parser.add_argument("--vocab-size", type=int, default=16000, help="Vocabulary size")
     parser.add_argument("--hidden-size", type=int, default=256, help="Hidden size")
     parser.add_argument("--num-layers", type=int, default=6, help="Number of layers")
@@ -1118,6 +1129,48 @@ def main():
     parser.add_argument("--use-accelerate", action="store_true", help="Enable accelerate-based multi-GPU training")
     
     args = parser.parse_args()
+    
+    # Auto-calculate architecture from target parameters if provided
+    if args.target_parameters is not None:
+        if not HAS_ARCH_UTILS:
+            raise ImportError("Architecture utilities not available. Ensure utils/architecture.py exists.")
+        
+        # Check if manual architecture args are also provided
+        manual_args = [args.hidden_size, args.num_layers, args.num_heads, args.head_dim, args.mlp_ratio]
+        if all(arg is not None and arg != parser.get_default("hidden_size") for arg in manual_args):
+            print("WARNING: --target-parameters specified. Manual architecture arguments will be overridden.")
+            print(f"  Ignoring: --hidden-size={args.hidden_size}, --num-layers={args.num_layers}, --num-heads={args.num_heads}")
+            print()
+        
+        print(f"\n=== Auto-calculating architecture for {args.target_parameters:,} parameters ===")
+        print(f"Base profile: {args.base_profile}")
+        
+        auto_config = config_from_params(
+            target_params=args.target_parameters,
+            base_profile=args.base_profile,
+            vocab_size=args.vocab_size,
+            max_seq_len=args.seq_len,
+            mtp_enabled=args.mtp_enabled and (not args.no_mtp),
+            mtp_num_heads=args.mtp_num_heads,
+        )
+        
+        estimated_params = estimate_params(auto_config)
+        print(f"Calculated configuration:")
+        print(f"  Hidden size: {auto_config['hidden_size']}")
+        print(f"  Num layers: {auto_config['num_layers']}")
+        print(f"  Num heads: {auto_config['num_heads']}")
+        print(f"  Head dim: {auto_config['head_dim']}")
+        print(f"  Estimated params: {estimated_params:,}")
+        print(f"  Target params: {args.target_parameters:,}")
+        print(f"  Error: {abs(estimated_params - args.target_parameters):,} ({abs(estimated_params - args.target_parameters) / args.target_parameters * 100:.2f}%)")
+        print()
+        
+        # Override manual arguments with auto-calculated values
+        args.hidden_size = auto_config['hidden_size']
+        args.num_layers = auto_config['num_layers']
+        args.num_heads = auto_config['num_heads']
+        args.head_dim = auto_config['head_dim']
+        args.mlp_ratio = auto_config.get('mlp_ratio', args.mlp_ratio)
     
     # Parse MTP loss weights
     mtp_loss_weights = [float(x.strip()) for x in args.mtp_loss_weights.split(",") if x.strip()]

@@ -30,10 +30,11 @@ from transformers import AutoModelForCausalLM, AutoConfig, PreTrainedModel
 from transformers.modeling_utils import load_state_dict
 
 from pretrain import DualModeModel, ARHead, DiffusionHead
+from utils.architecture import estimate_params, normalize_heads, calculate_target_config
 
 
 # ============================================================================
-# Scaling Methods
+# Helper Functions
 # ============================================================================
 
 def _estimate_params(config: Dict[str, Any]) -> int:
