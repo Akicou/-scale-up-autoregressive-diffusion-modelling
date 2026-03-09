@@ -155,7 +155,24 @@ class BaseFinetuner(ABC):
         if os.path.exists(tokenizer_path):
             tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
         else:
-            raise FileNotFoundError(f"Tokenizer not found at {tokenizer_path}")
+            checkpoints_dir = Path("./checkpoints")
+            available = []
+            if checkpoints_dir.is_dir():
+                for child in sorted(checkpoints_dir.iterdir()):
+                    if child.is_dir() and (
+                        (child / "model.pt").exists()
+                        or (child / "config.json").exists()
+                        or (child / "tokenizer.json").exists()
+                    ):
+                        available.append(str(child))
+            hint = ""
+            if available:
+                hint = f" Available checkpoint directories: {', '.join(available)}."
+            raise FileNotFoundError(
+                f"Tokenizer not found at {tokenizer_path}."
+                " Pass --model-path/--tokenizer-path explicitly or use a YAML config under config/."
+                f"{hint}"
+            )
         
         # Ensure padding token is set
         if tokenizer.pad_token is None:

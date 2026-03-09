@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 from pathlib import Path
 
@@ -10,9 +11,95 @@ ROOT_DIR = Path(__file__).resolve().parents[1]
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
-from finetune.config import resolve_finetune_type, override_config_from_args
+from finetune.config import resolve_finetune_type, override_config_from_args, trainer_config_from_yaml
 from finetune.base import BaseFinetuner, TrainerConfig
 from finetune.dpo import DPOConfig
+
+
+DEFAULT_MODEL_PATH = "./checkpoints/10m_pretrain"
+
+
+def _is_finetune_checkpoint(path: Path) -> bool:
+    if not path.is_dir():
+        return False
+    if (path / "model.pt").exists() and (path / "config.pt").exists():
+        return True
+    if (path / "config.json").exists():
+        return True
+    if list(path.glob("*.safetensors")):
+        return True
+    if list(path.glob("pytorch_model*.bin")):
+        return True
+    return False
+
+
+def _checkpoint_priority(path: Path) -> tuple[int, float, str]:
+    name = path.name.lower()
+    if "scaled" in name:
+        rank = 0
+    elif "sft" in name:
+        rank = 1
+    elif "pretrain" in name:
+        rank = 2
+    else:
+        rank = 3
+    try:
+        mtime = -path.stat().st_mtime
+    except OSError:
+        mtime = 0.0
+    return (rank, mtime, name)
+
+
+def _discover_checkpoint() -> str | None:
+    env_model_path = os.getenv("FINETUNE_MODEL_PATH")
+    if env_model_path and _is_finetune_checkpoint(Path(env_model_path)):
+        return env_model_path
+
+    candidates = [
+        Path("./checkpoints/4b_scaled"),
+        Path("./checkpoints/1b_scaled"),
+        Path(DEFAULT_MODEL_PATH),
+    ]
+    for candidate in candidates:
+        if _is_finetune_checkpoint(candidate):
+            return str(candidate)
+
+    checkpoints_dir = Path("./checkpoints")
+    if not checkpoints_dir.is_dir():
+        return None
+
+    discovered = sorted(
+        (path for path in checkpoints_dir.iterdir() if _is_finetune_checkpoint(path)),
+        key=_checkpoint_priority,
+    )
+    if discovered:
+        return str(discovered[0])
+    return None
+
+
+def _resolve_model_path(model_path: str | None) -> str:
+    if model_path:
+        return model_path
+
+    discovered = _discover_checkpoint()
+    if discovered:
+        if discovered != DEFAULT_MODEL_PATH:
+            print(f"No --model-path provided; using detected checkpoint at {discovered}")
+        return discovered
+    return DEFAULT_MODEL_PATH
+
+
+def _resolve_config_model_path(model_path: str) -> str:
+    if Path(model_path).exists():
+        return model_path
+    if model_path != DEFAULT_MODEL_PATH:
+        return model_path
+
+    discovered = _discover_checkpoint()
+    if discovered and discovered != model_path:
+        print(f"Configured model path {model_path} not found; using detected checkpoint at {discovered}")
+        return discovered
+    return model_path
 
 
 def parse_args() -> argparse.Namespace:
@@ -74,10 +161,12 @@ def main() -> None:
         else:
             config = trainer_config_from_yaml(args.config, TrainerConfig)
         config = override_config_from_args(config, args, skip={"config_path"})
+        config.model_path = _resolve_config_model_path(config.model_path)
     else:
+        model_path = _resolve_model_path(args.model_path)
         if hasattr(args, "reference_free") and (args.reference_free or args.beta is not None or args.loss_type or args.reference_model_path):
             config = DPOConfig(
-                model_path=args.model_path or "./checkpoints/10m_pretrain",
+                model_path=model_path,
                 output_dir=args.output_dir or "./checkpoints/finetuned",
                 epochs=args.epochs or 3,
                 batch_size=args.batch_size or 8,
@@ -113,7 +202,7 @@ def main() -> None:
             )
         else:
             config = TrainerConfig(
-                model_path=args.model_path or "./checkpoints/10m_pretrain",
+                model_path=model_path,
                 output_dir=args.output_dir or "./checkpoints/finetuned",
                 epochs=args.epochs or 3,
                 batch_size=args.batch_size or 8,
