@@ -204,11 +204,6 @@ class DPOTrainer(BaseFinetuner):
                 trust_remote_code=True,
             )
         
-        # Freeze model for reference if reference-free
-        if self.config.reference_free:
-            for param in model.parameters():
-                param.requires_grad = False
-        
         # Gradient checkpointing
         if self.config.use_gradient_checkpointing:
             model.gradient_checkpointing_enable()

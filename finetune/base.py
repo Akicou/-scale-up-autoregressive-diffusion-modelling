@@ -5,6 +5,7 @@ Base finetuner class with common training functionality.
 
 import argparse
 import json
+import math
 import os
 import shutil
 from abc import ABC, abstractmethod
@@ -365,7 +366,7 @@ class BaseFinetuner(ABC):
         self.model.train()
         
         num_epochs = self.config.epochs
-        num_training_steps = len(self.train_loader) * num_epochs
+        num_training_steps = math.ceil(len(self.train_loader) / max(1, self.config.gradient_accumulation_steps)) * num_epochs
         
         progress_bar = tqdm(total=num_training_steps, desc="Training")
         
@@ -374,8 +375,9 @@ class BaseFinetuner(ABC):
             epoch_metrics = {}
             
             for batch_idx, batch in enumerate(self.train_loader):
-                # Training step
-                step_metrics = self.training_step(batch)
+                with self.accelerator.accumulate(self.model):
+                    step_metrics = self.training_step(batch)
+                    stepped = self.accelerator.sync_gradients
                 
                 # Aggregate metrics across batches
                 for k, v in step_metrics.items():
@@ -383,6 +385,12 @@ class BaseFinetuner(ABC):
                         epoch_metrics[k] = 0
                     epoch_metrics[k] += v
                 
+                if not stepped:
+                    continue
+
+                self.global_step += 1
+                progress_bar.update(1)
+
                 # Log
                 if self.global_step % self.config.log_interval == 0:
                     avg_metrics = {k: v / (batch_idx + 1) for k, v in epoch_metrics.items()}
@@ -397,9 +405,6 @@ class BaseFinetuner(ABC):
                     eval_metrics = self.evaluate()
                     self.log_metrics(eval_metrics, "eval")
                     self.model.train()
-                
-                self.global_step += 1
-                progress_bar.update(1)
             
             # End of epoch
             avg_metrics = {k: v / len(self.train_loader) for k, v in epoch_metrics.items()}
@@ -477,7 +482,7 @@ class BaseFinetuner(ABC):
         parser.add_argument("--wandb-project", type=str, default=None)
         
         # Data
-        parser.add_argument("--train-data-path", type=str, default=None)
+        parser.add_argument("--train-data-path", "--data-path", dest="train_data_path", type=str, default=None)
         parser.add_argument("--eval-data-path", type=str, default=None)
 
         # Hugging Face dataset options

@@ -504,6 +504,155 @@ def _forward_mtp_logits(outputs: Any) -> List[torch.Tensor]:
     return mtp_logits or []
 
 
+def _generation_banned_ids() -> List[int]:
+    banned_ids = set()
+    if hasattr(model, "mask_token_id"):
+        banned_ids.add(int(model.mask_token_id))
+    if tokenizer.pad_token_id is not None:
+        banned_ids.add(int(tokenizer.pad_token_id))
+    return [token_id for token_id in banned_ids if token_id >= 0]
+
+
+def _apply_banned_ids(logits: torch.Tensor, banned_ids: List[int]) -> torch.Tensor:
+    if not banned_ids:
+        return logits
+    filtered = logits.clone()
+    vocab_size = filtered.shape[-1]
+    for bad_id in banned_ids:
+        if 0 <= bad_id < vocab_size:
+            filtered[..., bad_id] = float("-inf")
+    return filtered
+
+
+def _apply_top_k_top_p(logits: torch.Tensor, top_p: float = 1.0, top_k: int = 0) -> torch.Tensor:
+    filtered = logits.clone()
+
+    if top_k > 0 and top_k < filtered.shape[-1]:
+        topk_vals, _ = torch.topk(filtered, k=top_k, dim=-1)
+        kth_vals = topk_vals[..., -1, None]
+        filtered = torch.where(
+            filtered < kth_vals,
+            torch.full_like(filtered, float("-inf")),
+            filtered,
+        )
+
+    if top_p < 1.0:
+        sorted_logits, sorted_indices = torch.sort(filtered, descending=True, dim=-1)
+        sorted_probs = torch.softmax(sorted_logits, dim=-1)
+        cumulative_probs = torch.cumsum(sorted_probs, dim=-1)
+        sorted_indices_to_remove = cumulative_probs > top_p
+        sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
+        sorted_indices_to_remove[..., 0] = False
+        to_remove = torch.zeros_like(filtered, dtype=torch.bool)
+        to_remove.scatter_(-1, sorted_indices, sorted_indices_to_remove)
+        filtered = filtered.masked_fill(to_remove, float("-inf"))
+
+    return filtered
+
+
+def _sample_from_logits(logits: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    probs = torch.softmax(logits, dim=-1)
+    if probs.dim() == 1:
+        sampled = torch.multinomial(probs, num_samples=1)
+        confidence = probs.gather(0, sampled)
+        return sampled, confidence
+
+    flat_probs = probs.reshape(-1, probs.shape[-1])
+    sample_shape = probs.shape[:-1]
+    sampled = torch.multinomial(flat_probs, num_samples=1).view(*sample_shape)
+    confidence = probs.gather(-1, sampled.unsqueeze(-1)).squeeze(-1)
+    return sampled, confidence
+
+
+def _apply_repetition_penalty(logits: torch.Tensor, recent_ids: List[int], repetition_penalty: float) -> torch.Tensor:
+    if repetition_penalty <= 1.0 or not recent_ids:
+        return logits
+    filtered = logits.clone()
+    recent_unique = torch.tensor(sorted(set(recent_ids)), device=filtered.device, dtype=torch.long)
+    recent_unique = recent_unique[(recent_unique >= 0) & (recent_unique < filtered.shape[-1])]
+    if recent_unique.numel() > 0:
+        filtered[..., recent_unique] = filtered[..., recent_unique] / repetition_penalty
+    return filtered
+
+
+def _diffusion_remask_count(block_len: int, step: int, num_steps: int) -> int:
+    if block_len <= 1 or step >= num_steps - 1:
+        return 0
+    progress = (step + 1) / max(1, num_steps)
+    remask_ratio = 0.6 * (1.0 - progress)
+    remask_count = int(round(block_len * remask_ratio))
+    return min(max(0, remask_count), block_len - 1)
+
+
+def _diffusion_refine_block(
+    context_ids: torch.Tensor,
+    block_tokens: torch.Tensor,
+    num_steps: int,
+    temperature: float,
+    top_p: float,
+    top_k: int,
+    repetition_penalty: float,
+    verbose: bool,
+    label: str,
+) -> tuple[List[int], float]:
+    batch_size = context_ids.shape[0]
+    current_device = context_ids.device
+    if batch_size != 1:
+        raise ValueError("Diffusion decoding currently supports batch_size=1")
+
+    mask_token_id = model.mask_token_id if hasattr(model, "mask_token_id") else (tokenizer.pad_token_id if tokenizer.pad_token_id is not None else 0)
+    eos_token_id = tokenizer.eos_token_id
+    block_tokens = block_tokens.clone().to(current_device)
+    block_len = block_tokens.shape[1]
+    banned_ids = _generation_banned_ids()
+
+    start_time = time.time()
+    first_token_time = None
+
+    with torch.no_grad():
+        for step in range(num_steps):
+            generation_seq = torch.cat([context_ids, block_tokens], dim=1)
+            block_logits = _forward_diffusion_logits(generation_seq)[:, context_ids.shape[1]:, :] / max(1e-6, temperature)
+            step_banned = list(banned_ids)
+            if eos_token_id is not None and step < num_steps - 1:
+                step_banned.append(eos_token_id)
+            block_logits = _apply_banned_ids(block_logits, step_banned)
+            block_logits = _apply_repetition_penalty(block_logits, generation_seq[0].tolist()[-512:], repetition_penalty)
+            block_logits = _apply_top_k_top_p(block_logits, top_p=top_p, top_k=top_k)
+
+            masked_positions = block_tokens.eq(mask_token_id)
+            newly_filled = 0
+            if masked_positions.any():
+                sampled, _ = _sample_from_logits(block_logits[masked_positions])
+                block_tokens[masked_positions] = sampled
+                newly_filled = int(sampled.numel())
+                if first_token_time is None and newly_filled > 0:
+                    first_token_time = time.time() - start_time
+
+            token_probs = torch.softmax(block_logits, dim=-1)
+            token_conf = token_probs.gather(-1, block_tokens.unsqueeze(-1)).squeeze(-1)
+
+            remask_count = _diffusion_remask_count(block_len, step, num_steps)
+            if remask_count > 0:
+                lowest_conf_positions = torch.topk(token_conf[0], k=remask_count, largest=False).indices
+                block_tokens[0, lowest_conf_positions] = mask_token_id
+
+            remaining_masked = int(block_tokens.eq(mask_token_id).sum().item())
+            if verbose:
+                print(
+                    f"[{label}] Step {step + 1}/{num_steps}: "
+                    f"filled {newly_filled}, remasked {remask_count}, remaining {remaining_masked}"
+                )
+
+        if first_token_time is None:
+            first_token_time = time.time() - start_time
+
+    block_ids = block_tokens[0].tolist()
+    if eos_token_id is not None and eos_token_id in block_ids:
+        block_ids = block_ids[:block_ids.index(eos_token_id)]
+    return block_ids, first_token_time
+
+
 def complete_ar(input_ids: torch.Tensor, max_tokens: int, temperature: float, top_p: float, verbose: bool) -> tuple:
     """Generate tokens using auto-regressive mode (one token at a time)."""
     generated_ids = []
@@ -516,18 +665,10 @@ def complete_ar(input_ids: torch.Tensor, max_tokens: int, temperature: float, to
     with torch.no_grad():
         for _ in range(max_length - input_length):
             logits, _ = _forward_ar_outputs(input_ids)
-            next_token_logits = logits[0, -1, :] / temperature
-            if top_p < 1.0:
-                sorted_logits, sorted_indices = torch.sort(next_token_logits, descending=True)
-                cumulative_probs = torch.cumsum(torch.softmax(sorted_logits, dim=-1), dim=-1)
-                sorted_indices_to_remove = cumulative_probs > top_p
-                sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
-                sorted_indices_to_remove[..., 0] = 0
-                indices_to_remove = sorted_indices[sorted_indices_to_remove]
-                next_token_logits[indices_to_remove] = float("-inf")
-
-            probs = torch.softmax(next_token_logits, dim=-1)
-            next_token = torch.multinomial(probs, num_samples=1)
+            next_token_logits = logits[0, -1, :] / max(1e-6, temperature)
+            next_token_logits = _apply_banned_ids(next_token_logits, _generation_banned_ids())
+            next_token_logits = _apply_top_k_top_p(next_token_logits, top_p=top_p, top_k=0)
+            next_token, _ = _sample_from_logits(next_token_logits)
 
             if first_token_time is None:
                 first_token_time = time.time() - start_time
@@ -543,6 +684,52 @@ def complete_ar(input_ids: torch.Tensor, max_tokens: int, temperature: float, to
             if verbose:
                 token_text = tokenizer.decode([next_token.item()], skip_special_tokens=True)
                 print(f"[ar] {len(generated_ids)}: {token_text!r}")
+
+    return generated_ids, first_token_time if first_token_time else time.time() - start_time
+
+
+def complete_combined(input_ids: torch.Tensor, max_tokens: int, temperature: float, top_p: float, verbose: bool) -> tuple:
+    """Generate tokens by combining AR next-token logits with diffusion logits on an appended mask token."""
+    if not load_context.capabilities.supports_diffusion:
+        _warn_mode_fallback("combined", "ar", verbose)
+        return complete_ar(input_ids, max_tokens, temperature, top_p, verbose)
+
+    mask_token_id = model.mask_token_id if hasattr(model, "mask_token_id") else (tokenizer.pad_token_id if tokenizer.pad_token_id is not None else 0)
+    generated_ids = []
+    start_time = time.time()
+    first_token_time = None
+    input_length = input_ids.shape[1]
+    model_max_len = getattr(model, "max_seq_len", getattr(getattr(model, "config", None), "max_position_embeddings", input_length + max_tokens))
+    max_length = min(input_length + max_tokens, model_max_len)
+
+    with torch.no_grad():
+        for _ in range(max_length - input_length):
+            ar_logits, _ = _forward_ar_outputs(input_ids)
+            masked_input = torch.cat(
+                [input_ids, torch.tensor([[mask_token_id]], device=input_ids.device, dtype=torch.long)],
+                dim=1,
+            )
+            diffusion_logits = _forward_diffusion_logits(masked_input)
+            next_token_logits = (ar_logits[0, -1, :] + diffusion_logits[0, -1, :]) / (2.0 * max(1e-6, temperature))
+            next_token_logits = _apply_banned_ids(next_token_logits, _generation_banned_ids())
+            next_token_logits = _apply_top_k_top_p(next_token_logits, top_p=top_p, top_k=0)
+            next_token, _ = _sample_from_logits(next_token_logits)
+
+            if first_token_time is None:
+                first_token_time = time.time() - start_time
+                if verbose:
+                    print(f"[combined] First token at {first_token_time:.3f}s")
+
+            token_id = int(next_token.item())
+            if token_id == tokenizer.eos_token_id:
+                break
+
+            generated_ids.append(token_id)
+            input_ids = torch.cat([input_ids, next_token.unsqueeze(0)], dim=1)
+
+            if verbose:
+                token_text = tokenizer.decode([token_id], skip_special_tokens=True)
+                print(f"[combined] {len(generated_ids)}: {token_text!r}")
 
     return generated_ids, first_token_time if first_token_time else time.time() - start_time
 
@@ -596,108 +783,25 @@ def complete_diffusion(
                 break
 
             input_length = context_ids.shape[1]
-            generation_seq = torch.full(
-                (batch_size, input_length + max_block),
+            block_tokens = torch.full(
+                (batch_size, max_block),
                 mask_token_id,
                 dtype=torch.long,
                 device=current_device,
             )
-            generation_seq[:, :input_length] = context_ids
-
-            masked_positions = torch.zeros(
-                (batch_size, input_length + max_block),
-                dtype=torch.bool,
-                device=current_device,
+            block_ids, block_first_token_time = _diffusion_refine_block(
+                context_ids,
+                block_tokens,
+                num_steps=num_steps,
+                temperature=temperature,
+                top_p=top_p,
+                top_k=top_k,
+                repetition_penalty=repetition_penalty,
+                verbose=verbose,
+                label="diffusion",
             )
-            masked_positions[:, input_length:] = True
-
-            for step in range(num_steps):
-                diffusion_logits = _forward_diffusion_logits(generation_seq) / max(1e-6, temperature)
-
-                for bad_id in banned_ids:
-                    if 0 <= bad_id < vocab_size:
-                        diffusion_logits[:, input_length:, bad_id] = float("-inf")
-                if eos_token_id is not None and step < num_steps - 1 and 0 <= eos_token_id < vocab_size:
-                    diffusion_logits[:, input_length:, eos_token_id] = float("-inf")
-
-                probs = torch.softmax(diffusion_logits, dim=-1)
-                pred_conf = probs.max(dim=-1).values
-
-                progress = (step + 1) / num_steps
-                conf_threshold = 0.92 - (0.42 * progress)
-
-                total_newly_fixed = 0
-                for batch_index in range(batch_size):
-                    masked_idx = masked_positions[batch_index].nonzero(as_tuple=True)[0]
-                    if len(masked_idx) == 0:
-                        continue
-
-                    masked_conf = pred_conf[batch_index, masked_idx]
-                    masked_logits = diffusion_logits[batch_index, masked_idx, :].clone()
-
-                    if repetition_penalty > 1.0:
-                        recent_ids = generation_seq[batch_index, :].tolist()[-512:]
-                        if recent_ids:
-                            recent_unique = torch.tensor(sorted(set(recent_ids)), device=masked_logits.device, dtype=torch.long)
-                            recent_unique = recent_unique[(recent_unique >= 0) & (recent_unique < masked_logits.shape[-1])]
-                            if recent_unique.numel() > 0:
-                                masked_logits[:, recent_unique] = masked_logits[:, recent_unique] / repetition_penalty
-
-                    if top_k > 0 and top_k < masked_logits.shape[-1]:
-                        topk_vals, _ = torch.topk(masked_logits, k=top_k, dim=-1)
-                        kth_vals = topk_vals[:, -1].unsqueeze(-1)
-                        masked_logits = torch.where(
-                            masked_logits < kth_vals,
-                            torch.full_like(masked_logits, float("-inf")),
-                            masked_logits,
-                        )
-
-                    if top_p < 1.0:
-                        sorted_logits, sorted_indices = torch.sort(masked_logits, descending=True, dim=-1)
-                        sorted_probs = torch.softmax(sorted_logits, dim=-1)
-                        cumulative_probs = torch.cumsum(sorted_probs, dim=-1)
-                        sorted_indices_to_remove = cumulative_probs > top_p
-                        sorted_indices_to_remove[:, 1:] = sorted_indices_to_remove[:, :-1].clone()
-                        sorted_indices_to_remove[:, 0] = False
-                        to_remove = torch.zeros_like(masked_logits, dtype=torch.bool)
-                        to_remove.scatter_(1, sorted_indices, sorted_indices_to_remove)
-                        masked_logits = masked_logits.masked_fill(to_remove, float("-inf"))
-
-                    masked_probs = torch.softmax(masked_logits, dim=-1)
-                    sampled = torch.multinomial(masked_probs, num_samples=1).squeeze(-1)
-
-                    remaining = len(masked_idx)
-                    min_fix = max(1, remaining // max(1, (num_steps - step)))
-                    threshold_sel = masked_conf >= conf_threshold
-                    if threshold_sel.sum().item() < min_fix:
-                        _, topk_idx = torch.topk(masked_conf, k=min_fix)
-                        selected_mask = torch.zeros_like(threshold_sel)
-                        selected_mask[topk_idx] = True
-                    else:
-                        selected_mask = threshold_sel
-
-                    selected_positions = masked_idx[selected_mask]
-                    selected_tokens = sampled[selected_mask]
-
-                    if len(selected_positions) > 0:
-                        generation_seq[batch_index, selected_positions] = selected_tokens
-                        masked_positions[batch_index, selected_positions] = False
-                        total_newly_fixed += len(selected_positions)
-
-                remaining_masked = int(masked_positions.sum().item())
-                if verbose:
-                    print(
-                        f"[diffusion] Step {step + 1}/{num_steps}: "
-                        f"fixed {total_newly_fixed}, remaining {remaining_masked}, thr={conf_threshold:.2f}"
-                    )
-                if remaining_masked == 0:
-                    if verbose:
-                        print(f"[diffusion] Early stopping at step {step + 1}")
-                    break
-
-            block_ids = generation_seq[0, input_length:].tolist()
             if first_token_time is None and block_ids:
-                first_token_time = time.time() - start_time
+                first_token_time = block_first_token_time
 
             if eos_token_id is not None and eos_token_id in block_ids:
                 eos_pos = block_ids.index(eos_token_id)
@@ -736,22 +840,18 @@ def complete_medusa(input_ids: torch.Tensor, max_tokens: int, temperature: float
             ar_logits, outputs = _forward_ar_outputs(input_ids)
             mtp_logits = _forward_mtp_logits(outputs)
 
-            next_token_logits = ar_logits[0, -1, :] / temperature
-            if top_p < 1.0:
-                sorted_logits, sorted_indices = torch.sort(next_token_logits, descending=True)
-                cumulative_probs = torch.cumsum(torch.softmax(sorted_logits, dim=-1), dim=-1)
-                sorted_indices_to_remove = cumulative_probs > top_p
-                sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
-                sorted_indices_to_remove[..., 0] = 0
-                indices_to_remove = sorted_indices[sorted_indices_to_remove]
-                next_token_logits[indices_to_remove] = float("-inf")
-            probs = torch.softmax(next_token_logits, dim=-1)
-            candidate_tokens = [torch.multinomial(probs, num_samples=1).item()]
+            next_token_logits = ar_logits[0, -1, :] / max(1e-6, temperature)
+            next_token_logits = _apply_banned_ids(next_token_logits, _generation_banned_ids())
+            next_token_logits = _apply_top_k_top_p(next_token_logits, top_p=top_p, top_k=0)
+            next_token, _ = _sample_from_logits(next_token_logits)
+            candidate_tokens = [int(next_token.item())]
 
             for head_logits in mtp_logits[:3]:
-                head_token_logits = head_logits[0, -1, :] / temperature
-                head_probs = torch.softmax(head_token_logits, dim=-1)
-                candidate_tokens.append(torch.multinomial(head_probs, num_samples=1).item())
+                head_token_logits = head_logits[0, -1, :] / max(1e-6, temperature)
+                head_token_logits = _apply_banned_ids(head_token_logits, _generation_banned_ids())
+                head_token_logits = _apply_top_k_top_p(head_token_logits, top_p=top_p, top_k=0)
+                sampled_head_token, _ = _sample_from_logits(head_token_logits)
+                candidate_tokens.append(int(sampled_head_token.item()))
 
             accepted = 0
             for token_id in candidate_tokens:
@@ -788,20 +888,28 @@ def complete_medusa_diffusion(
     verbose: bool = True,
 ) -> tuple:
     """Hybrid mode: medusa draft first, then diffusion refinement conditioned on the original prompt."""
-    if not (load_context.capabilities.supports_mtp and load_context.capabilities.supports_diffusion):
-        _warn_mode_fallback("medusa+diffusion", "ar", verbose)
-        return complete_ar(input_ids, max_tokens, temperature, top_p, verbose)
+    if not load_context.capabilities.supports_mtp:
+        _warn_mode_fallback("medusa+diffusion", "diffusion", verbose)
+        return complete_diffusion(input_ids, max_tokens, num_steps=12, temperature=temperature, top_p=top_p, top_k=64, block_size=256, repetition_penalty=1.1, verbose=verbose)
+    if not load_context.capabilities.supports_diffusion:
+        _warn_mode_fallback("medusa+diffusion", "medusa", verbose)
+        return complete_medusa(input_ids, max_tokens, temperature, top_p, verbose)
 
     drafted_ids, medusa_ttft = complete_medusa(input_ids.clone(), max_tokens, temperature, top_p, verbose)
     if len(drafted_ids) == 0:
         return drafted_ids, medusa_ttft
 
-    refined_ids, _ = complete_diffusion(
+    draft_tensor = torch.tensor([drafted_ids], device=input_ids.device, dtype=torch.long)
+    refined_ids, _ = _diffusion_refine_block(
         input_ids.clone(),
-        max_tokens=len(drafted_ids),
+        draft_tensor,
         num_steps=12,
         temperature=max(0.8, temperature),
+        top_p=top_p,
+        top_k=64,
+        repetition_penalty=1.1,
         verbose=verbose,
+        label="medusa+diffusion",
     )
 
     final_ids = refined_ids[: len(drafted_ids)] if refined_ids else drafted_ids
@@ -844,7 +952,7 @@ def complete(
             verbose=verbose,
         )
     elif mode == "combined":
-        generated_ids, first_token_time = complete_ar(input_ids, max_tokens, temperature, top_p, verbose)
+        generated_ids, first_token_time = complete_combined(input_ids, max_tokens, temperature, top_p, verbose)
     elif mode == "reasoning":
         generated_ids, first_token_time = complete_ar(input_ids, max_tokens, temperature, top_p, verbose)
     elif mode == "medusa":

@@ -271,7 +271,7 @@ This path now auto-exports custom checkpoints to a self-contained HF directory w
 ```bash
 python -m finetune.sft \
   --model-path ./checkpoints/4b_scaled \
-  --data-path ./data/instruction.json \
+  --train-data-path ./data/instruction.json \
   --output-dir ./checkpoints/4b_sft \
   --use-lora \
   --lora-r 16 \
@@ -289,7 +289,7 @@ python -m finetune --config config/finetune_dpo_qlora.yaml
 # Or with CLI flags
 python -m finetune.dpo \
   --model-path ./checkpoints/4b_sft \
-  --data-path ./data/preference.json \
+  --train-data-path ./data/preference.json \
   --output-dir ./checkpoints/4b_dpo \
   --use-qlora \
   --beta 0.1 \
@@ -301,7 +301,7 @@ python -m finetune.dpo \
 ```bash
 python -m finetune.dpo \
   --model-path ./checkpoints/4b_sft \
-  --data-path ./data/preference.json \
+  --train-data-path ./data/preference.json \
   --output-dir ./checkpoints/4b_dpo \
   --beta 0.1
 ```
@@ -440,7 +440,7 @@ SFT trainer with LoRA/QLoRA support.
 **Arguments:**
 
 - `--model-path`: Model to finetune
-- `--data-path`: Training data
+- `--train-data-path` / `--data-path`: Training data
 - `--use-lora`: Enable LoRA
 - `--use-qlora`: Enable QLoRA (4-bit quantization)
 - `--lora-r`: LoRA rank
@@ -454,7 +454,7 @@ DPO trainer for preference optimization.
 **Arguments:**
 
 - `--model-path`: Model to finetune
-- `--data-path`: Preference data
+- `--train-data-path` / `--data-path`: Preference data
 - `--beta`: KL penalty coefficient
 - `--loss-type`: Loss type (sigmoid, hinge, ipo)
 - `--reference-free`: Skip reference model for VRAM efficiency

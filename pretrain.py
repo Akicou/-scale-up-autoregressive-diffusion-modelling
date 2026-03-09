@@ -1012,6 +1012,8 @@ def evaluate(model: nn.Module, dataloader: DataLoader, config: TrainingConfig, a
                        config.diffusion_loss_weight * outputs.get("diffusion_loss", 0)
             elif config.loss_mode == "ar":
                 loss = outputs.get("ar_loss", 0)
+            elif config.loss_mode == "diffusion":
+                loss = outputs.get("diffusion_loss", 0)
             else:
                 loss = outputs.get("ar_loss", 0)
 

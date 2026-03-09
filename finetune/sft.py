@@ -37,7 +37,6 @@ from transformers import (
     AutoTokenizer,
     PreTrainedModel,
     PreTrainedTokenizer,
-    DataCollatorForLanguageModeling,
     BitsAndBytesConfig,
 )
 from peft import LoraConfig, get_peft_model, TaskType
@@ -659,25 +658,22 @@ class SFTTrainer(BaseFinetuner):
                     max_seq_length=self.config.max_seq_length,
                 )
         
-        # Data collator
-        data_collator = DataCollatorForLanguageModeling(
-            tokenizer=self.tokenizer,
-            mlm=False,  # Causal LM
-        )
+        def collate_fn(batch: List[Dict[str, torch.Tensor]]) -> Dict[str, torch.Tensor]:
+            return {key: torch.stack([example[key] for example in batch]) for key in batch[0]}
         
         # Create dataloaders
         train_loader = DataLoader(
             train_dataset,
             batch_size=self.config.batch_size,
             shuffle=True,
-            collate_fn=data_collator,
+            collate_fn=collate_fn,
         )
         
         eval_loader = DataLoader(
             eval_dataset,
             batch_size=self.config.batch_size,
             shuffle=False,
-            collate_fn=data_collator,
+            collate_fn=collate_fn,
         )
         
         return train_loader, eval_loader

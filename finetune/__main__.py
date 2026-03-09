@@ -134,7 +134,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--log-interval", type=int, default=None)
     parser.add_argument("--eval-interval", type=int, default=None)
     parser.add_argument("--save-interval", type=int, default=None)
-    parser.add_argument("--train-data-path", type=str, default=None)
+    parser.add_argument("--train-data-path", "--data-path", dest="train_data_path", type=str, default=None)
     parser.add_argument("--eval-data-path", type=str, default=None)
     parser.add_argument("--hf-dataset-name", type=str, default=None)
     parser.add_argument("--hf-train-split", type=str, default=None)
