@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import shutil
 from pathlib import Path
 from typing import Tuple
 
@@ -96,3 +97,10 @@ def ensure_hf_export(
 
     export_dualmode_to_hf(checkpoint_path, target_dir)
     return target_dir
+
+
+def clear_hf_module_cache(export_dir: str | Path) -> None:
+    module_name = Path(export_dir).name
+    cache_dir = Path.home() / ".cache" / "huggingface" / "modules" / "transformers_modules" / module_name
+    if cache_dir.exists():
+        shutil.rmtree(cache_dir, ignore_errors=True)

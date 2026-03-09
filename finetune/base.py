@@ -267,7 +267,7 @@ class BaseFinetuner(ABC):
         self.model = self.setup_model()
         
         # Apply LoRA if configured (custom DualMode wrapper handles its own LoRA path)
-        if self.config.use_lora and not getattr(self.model, "_is_custom_dualmode", False):
+        if self.config.use_lora and not getattr(self.model, "_is_custom_dualmode", False) and not getattr(self.model, "_peft_adapter_configured", False):
             self.model = self.setup_lora(self.model)
         
         # Setup data

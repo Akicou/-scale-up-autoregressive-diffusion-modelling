@@ -15,7 +15,7 @@ ROOT_DIR = Path(__file__).resolve().parents[1]
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
-from pretrain import get_default_tokenizer
+from pretrain import DualModeModel, get_default_tokenizer
 
 TEMPLATE_DIR = Path(__file__).resolve().parent / "hf_export_templates"
 EXPORT_VERSION = 1
@@ -133,6 +133,37 @@ def _map_state_dict(state_dict: dict) -> Tuple[dict, List[str]]:
     return hf_state_dict, ignored
 
 
+def _build_template_state(model_cfg: dict) -> dict:
+    base_vocab = model_cfg.get("original_vocab_size") or model_cfg.get("base_vocab_size") or model_cfg.get("vocab_size", 16001) - 1
+    template_model = DualModeModel(
+        vocab_size=base_vocab,
+        hidden_size=int(model_cfg.get("hidden_size", 256)),
+        num_layers=int(model_cfg.get("num_layers", 6)),
+        num_heads=int(model_cfg.get("num_heads", 4)),
+        head_dim=int(model_cfg.get("head_dim", 64)),
+        mlp_ratio=float(model_cfg.get("mlp_ratio", 4.0)),
+        max_seq_len=int(model_cfg.get("max_seq_len", 4096)),
+        mtp_enabled=bool(model_cfg.get("mtp_enabled", False)),
+        mtp_num_heads=int(model_cfg.get("mtp_num_heads", 0)),
+        mtp_loss_weights=model_cfg.get("mtp_loss_weights", [1.0, 0.7, 0.5]),
+    )
+    return template_model.state_dict()
+
+
+def _patch_state_dict_to_template(state_dict: dict, template_state: dict) -> dict:
+    patched_state = {}
+    for key, value in state_dict.items():
+        template_value = template_state.get(key)
+        if template_value is None or template_value.shape == value.shape:
+            patched_state[key] = value
+            continue
+        patched = template_value.clone()
+        slices = tuple(slice(0, min(dst, src)) for dst, src in zip(template_value.shape, value.shape))
+        patched[slices] = value[slices]
+        patched_state[key] = patched
+    return patched_state
+
+
 def _copy_or_create_tokenizer(checkpoint_dir: Path, output_dir: Path) -> None:
     tokenizer_files = [
         "tokenizer.json",
@@ -185,6 +216,7 @@ def export_dualmode_to_hf(
 
     config_dict, model_cfg = _load_checkpoint_config(checkpoint_dir)
     state_dict = torch.load(checkpoint_dir / "model.pt", map_location="cpu")
+    state_dict = _patch_state_dict_to_template(state_dict, _build_template_state(model_cfg))
 
     print(
         f"Exporting {model_cfg.get('num_layers', 6)}L x {model_cfg.get('hidden_size', 256)}H model "

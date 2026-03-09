@@ -223,7 +223,14 @@ class NayheinMiniModel(nn.Module):
         if position_ids is None:
             position_ids = torch.arange(past_len, past_len + seq_len, device=input_ids.device).unsqueeze(0).expand(batch_size, -1)
         pos_embed_ids = position_ids % self.position_embeddings.num_embeddings
-        hidden_states = self.embed_tokens(input_ids) + self.position_embeddings(pos_embed_ids)
+        token_embeds = self.embed_tokens(input_ids)
+        position_embeds = self.position_embeddings(pos_embed_ids)
+        if position_embeds.size(-1) != token_embeds.size(-1):
+            if position_embeds.size(-1) < token_embeds.size(-1):
+                position_embeds = F.pad(position_embeds, (0, token_embeds.size(-1) - position_embeds.size(-1)))
+            else:
+                position_embeds = position_embeds[..., :token_embeds.size(-1)]
+        hidden_states = token_embeds + position_embeds
         hidden_states = self.embed_layernorm(hidden_states)
 
         all_hidden_states = () if output_hidden_states else None
@@ -294,11 +301,6 @@ class NayheinMiniPreTrainedModel(PreTrainedModel):
         elif isinstance(module, nn.LayerNorm):
             nn.init.ones_(module.weight)
             nn.init.zeros_(module.bias)
-
-    def _set_gradient_checkpointing(self, module: nn.Module, value: bool = False) -> None:
-        if isinstance(module, NayheinMiniModel):
-            module.gradient_checkpointing = value
-
 
 class NayheinMiniForCausalLM(NayheinMiniPreTrainedModel):
     _tied_weights_keys = []

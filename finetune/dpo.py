@@ -30,7 +30,7 @@ from transformers import (
 from peft import LoraConfig, get_peft_model, TaskType, PeftModel
 
 from .base import BaseFinetuner, TrainerConfig
-from .custom_checkpoint import ensure_hf_export, is_custom_checkpoint_dir
+from .custom_checkpoint import clear_hf_module_cache, ensure_hf_export, is_custom_checkpoint_dir
 from pretrain import get_default_tokenizer
 
 
@@ -164,7 +164,9 @@ class DPOTrainer(BaseFinetuner):
 
     def _resolve_hf_model_path(self, model_path: str) -> str:
         if self.config.use_qlora and is_custom_checkpoint_dir(model_path):
-            return str(ensure_hf_export(model_path))
+            export_dir = ensure_hf_export(model_path)
+            clear_hf_module_cache(export_dir)
+            return str(export_dir)
         return model_path
     
     def setup_model(self) -> PreTrainedModel:
@@ -217,7 +219,8 @@ class DPOTrainer(BaseFinetuner):
         if is_custom_checkpoint_dir(self.config.model_path):
             if self.config.use_qlora:
                 export_dir = ensure_hf_export(self.config.model_path)
-                tokenizer = AutoTokenizer.from_pretrained(export_dir)
+                clear_hf_module_cache(export_dir)
+                tokenizer = AutoTokenizer.from_pretrained(export_dir, trust_remote_code=True)
             else:
                 tokenizer = get_default_tokenizer()
             if tokenizer.pad_token is None:

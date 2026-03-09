@@ -49,7 +49,7 @@ except ImportError:
     HAS_BNB = False
 
 from .base import BaseFinetuner, TrainerConfig
-from .custom_checkpoint import ensure_hf_export, is_custom_checkpoint_dir
+from .custom_checkpoint import clear_hf_module_cache, ensure_hf_export, is_custom_checkpoint_dir
 from pretrain import DualModeModel, get_default_tokenizer
 
 
@@ -462,6 +462,7 @@ class SFTTrainer(BaseFinetuner):
         if self._is_custom_checkpoint_dir(self.config.model_path):
             if self.config.use_qlora:
                 model_path_hf = str(ensure_hf_export(self.config.model_path))
+                clear_hf_module_cache(model_path_hf)
                 print(f"Loading HF-format model with 4-bit quantization: {model_path_hf}")
                 compute_dtype = torch.bfloat16 if self.config.quantization_compute_dtype == "bfloat16" else torch.float16
                 qconfig = BitsAndBytesConfig(
@@ -498,6 +499,7 @@ class SFTTrainer(BaseFinetuner):
                     inference_mode=False,
                 )
                 model = get_peft_model(model, peft_config)
+                model._peft_adapter_configured = True
                 model.print_trainable_parameters()
                 self._report_memory_estimate(model, use_qlora=True)
                 return model
@@ -598,7 +600,8 @@ class SFTTrainer(BaseFinetuner):
         if self._is_custom_checkpoint_dir(self.config.model_path):
             if self.config.use_qlora:
                 export_dir = ensure_hf_export(self.config.model_path)
-                tokenizer = AutoTokenizer.from_pretrained(export_dir)
+                clear_hf_module_cache(export_dir)
+                tokenizer = AutoTokenizer.from_pretrained(export_dir, trust_remote_code=True)
             else:
                 tokenizer = get_default_tokenizer()
             if tokenizer.pad_token is None:
