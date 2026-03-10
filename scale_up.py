@@ -230,6 +230,19 @@ def expand_linear_layer(
     return new_layer
 
 
+def expand_layer_norm(old_layer: nn.LayerNorm, new_hidden_size: int) -> nn.LayerNorm:
+    """Expand a layer norm to a new hidden size."""
+    new_layer = nn.LayerNorm(new_hidden_size, eps=old_layer.eps)
+    copy_size = min(new_hidden_size, old_layer.weight.shape[0])
+    with torch.no_grad():
+        new_layer.weight.data[:copy_size] = old_layer.weight.data[:copy_size]
+        new_layer.bias.data[:copy_size] = old_layer.bias.data[:copy_size]
+        if new_hidden_size > copy_size:
+            new_layer.weight.data[copy_size:] = 1.0
+            new_layer.bias.data[copy_size:] = 0.0
+    return new_layer
+
+
 def scale_model_width(
     model: DualModeModel,
     new_config: Dict[str, Any],
@@ -263,15 +276,17 @@ def scale_model_width(
             new_embedding_dim=new_config["hidden_size"],
         )
         
-        # Scale position embeddings (interpolate if needed)
-        new_model.position_embeddings = interpolate_position_embeddings(
+        # Scale position embeddings in both sequence length and hidden width.
+        interpolated_pos_embeddings = interpolate_position_embeddings(
             model.position_embeddings,
             new_config["max_seq_len"],
         )
+        new_model.position_embeddings = expand_embedding_dim(
+            interpolated_pos_embeddings,
+            new_embedding_dim=new_config["hidden_size"],
+        )
         
-        # Scale layer norm
-        new_model.embed_layernorm.weight.data = model.embed_layernorm.weight.data.clone()
-        new_model.embed_layernorm.bias.data = model.embed_layernorm.bias.data.clone()
+        new_model.embed_layernorm = expand_layer_norm(model.embed_layernorm, new_config["hidden_size"])
         
         # Scale each transformer layer
         for new_layer, old_layer in zip(new_model.layers, model.layers):
@@ -279,17 +294,21 @@ def scale_model_width(
             new_layer.attention.q_proj = expand_linear_layer(
                 old_layer.attention.q_proj,
                 new_out_features=new_config["num_heads"] * new_config["head_dim"],
+                new_in_features=new_config["hidden_size"],
             )
             new_layer.attention.k_proj = expand_linear_layer(
                 old_layer.attention.k_proj,
                 new_out_features=new_config["num_heads"] * new_config["head_dim"],
+                new_in_features=new_config["hidden_size"],
             )
             new_layer.attention.v_proj = expand_linear_layer(
                 old_layer.attention.v_proj,
                 new_out_features=new_config["num_heads"] * new_config["head_dim"],
+                new_in_features=new_config["hidden_size"],
             )
             new_layer.attention.o_proj = expand_linear_layer(
                 old_layer.attention.o_proj,
+                new_out_features=new_config["hidden_size"],
                 new_in_features=new_config["num_heads"] * new_config["head_dim"],
             )
             
@@ -303,25 +322,23 @@ def scale_model_width(
             new_layer.mlp.gate_proj = expand_linear_layer(
                 old_layer.mlp.gate_proj,
                 new_out_features=mlp_expand,
+                new_in_features=new_config["hidden_size"],
             )
             new_layer.mlp.up_proj = expand_linear_layer(
                 old_layer.mlp.up_proj,
                 new_out_features=mlp_expand,
+                new_in_features=new_config["hidden_size"],
             )
             new_layer.mlp.down_proj = expand_linear_layer(
                 old_layer.mlp.down_proj,
+                new_out_features=new_config["hidden_size"],
                 new_in_features=mlp_expand,
             )
             
-            # Scale layer norms
-            new_layer.input_layernorm.weight.data = old_layer.input_layernorm.weight.data.clone()
-            new_layer.input_layernorm.bias.data = old_layer.input_layernorm.bias.data.clone()
-            new_layer.post_attention_layernorm.weight.data = old_layer.post_attention_layernorm.weight.data.clone()
-            new_layer.post_attention_layernorm.bias.data = old_layer.post_attention_layernorm.bias.data.clone()
+            new_layer.input_layernorm = expand_layer_norm(old_layer.input_layernorm, new_config["hidden_size"])
+            new_layer.post_attention_layernorm = expand_layer_norm(old_layer.post_attention_layernorm, new_config["hidden_size"])
         
-        # Scale final layer norm
-        new_model.final_layernorm.weight.data = model.final_layernorm.weight.data.clone()
-        new_model.final_layernorm.bias.data = model.final_layernorm.bias.data.clone()
+        new_model.final_layernorm = expand_layer_norm(model.final_layernorm, new_config["hidden_size"])
         
         # Scale AR head - expand the lm_head inside ARHead
         new_ar_head_lm_head = expand_linear_layer(
@@ -338,9 +355,12 @@ def scale_model_width(
         new_model.diffusion_head.decoder = expand_linear_layer(
             model.diffusion_head.decoder,
             new_out_features=new_config["vocab_size"],
+            new_in_features=new_config["hidden_size"],
         )
-        new_model.diffusion_head.layer_norm.weight.data = model.diffusion_head.layer_norm.weight.data.clone()
-        new_model.diffusion_head.layer_norm.bias.data = model.diffusion_head.layer_norm.bias.data.clone()
+        new_model.diffusion_head.layer_norm = expand_layer_norm(
+            model.diffusion_head.layer_norm,
+            new_config["hidden_size"],
+        )
     
     return new_model
 
@@ -527,7 +547,10 @@ def scale_model(
     # Save model state dict
     torch.save(scaled_model.state_dict(), Path(output_path) / "model.pt")
     
-    # Save config
+    # Save model config in the same format as pretraining/inference expect.
+    torch.save(scaled_model.get_config(), Path(output_path) / "config.pt")
+
+    # Save scaling metadata separately.
     scaling_config = {
         "input_path": str(input_path),
         "output_path": output_path,
@@ -537,7 +560,7 @@ def scale_model(
         "current_config": current_config,
         "target_config": target_config,
     }
-    torch.save(scaling_config, Path(output_path) / "config.pt")
+    torch.save(scaling_config, Path(output_path) / "scaling_metadata.pt")
     
     print(f"\nScaled model saved to {output_path}")
     print(f"Config saved to {Path(output_path) / 'config.pt'}")

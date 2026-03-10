@@ -4,6 +4,8 @@ Shared utilities for finetuning.
 """
 
 import os
+from pathlib import Path
+from types import SimpleNamespace
 from typing import Dict, List, Optional, Any
 
 import torch
@@ -12,11 +14,71 @@ from torch.utils.data import DataLoader, Dataset
 from transformers import (
     AutoModelForCausalLM,
     AutoTokenizer,
+    BitsAndBytesConfig,
     PreTrainedModel,
     PreTrainedTokenizer,
     DataCollator,
+    DataCollatorForLanguageModeling,
 )
-from peft import LoraConfig, get_peft_model, TaskType, PeftModel
+from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training, TaskType, PeftModel
+from pretrain import DualModeModel
+
+
+class DualModeConfig:
+    """Minimal config surface for local dual-mode checkpoints."""
+
+    model_type = "dual_mode"
+    is_encoder_decoder = False
+    use_return_dict = True
+
+    def __init__(self, **kwargs):
+        self.__dict__.update(kwargs)
+
+    def to_dict(self) -> Dict[str, Any]:
+        return dict(self.__dict__)
+
+
+class DualModeCausalLMWrapper(nn.Module):
+    """Expose DualModeModel through a causal-LM-like interface."""
+
+    def __init__(self, model: DualModeModel):
+        super().__init__()
+        self.model = model
+        self.config = DualModeConfig(**model.get_config())
+
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+        labels: Optional[torch.Tensor] = None,
+        return_dict: bool = True,
+        **_: Any,
+    ):
+        outputs = self.model(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            labels=labels,
+            mode="ar",
+        )
+        if return_dict:
+            return SimpleNamespace(loss=outputs.get("ar_loss"), logits=outputs["ar_logits"])
+        return outputs["ar_logits"], outputs.get("ar_loss")
+
+    @property
+    def device(self) -> torch.device:
+        return next(self.parameters()).device
+
+    def gradient_checkpointing_enable(self):
+        self.model.enable_gradient_checkpointing()
+
+    def save_pretrained(self, output_dir: str):
+        self.model.save_pretrained(output_dir)
+
+    def get_input_embeddings(self):
+        return self.model.token_embeddings
+
+    def prepare_inputs_for_generation(self, input_ids: torch.Tensor, attention_mask: Optional[torch.Tensor] = None, **kwargs):
+        return {"input_ids": input_ids, "attention_mask": attention_mask}
 
 
 def setup_tokenizer(
@@ -72,18 +134,32 @@ def load_model_for_finetuning(
     Returns:
         Model (possibly with LoRA applied)
     """
-    # Load base model
+    model_path_obj = Path(model_path)
+    is_local_dual_mode = model_path_obj.is_dir() and (model_path_obj / "model.pt").exists() and (model_path_obj / "config.pt").exists()
+
+    if use_quantization and is_local_dual_mode:
+        raise ValueError("QLoRA is only supported for Hugging Face causal LM checkpoints in this repo, not local DualModeModel checkpoints.")
+
     model_kwargs = {
         "torch_dtype": torch_dtype,
         "device_map": device,
         "trust_remote_code": trust_remote_code,
     }
     
-    if use_quantization and quantization_config:
+    if use_quantization:
+        if quantization_config is None:
+            raise ValueError("Quantization requested without a quantization_config.")
         model_kwargs["quantization_config"] = quantization_config
     
-    model = AutoModelForCausalLM.from_pretrained(model_path, **model_kwargs)
-    
+    if is_local_dual_mode:
+        base_model = DualModeModel.from_pretrained(model_path, map_location="cpu")
+        base_model = base_model.to(dtype=torch_dtype)
+        model = DualModeCausalLMWrapper(base_model)
+    else:
+        model = AutoModelForCausalLM.from_pretrained(model_path, **model_kwargs)
+        if use_quantization:
+            model = prepare_model_for_kbit_training(model)
+
     # Apply LoRA
     if use_lora:
         if lora_config is None:
@@ -101,6 +177,31 @@ def load_model_for_finetuning(
         model.print_trainable_parameters()
     
     return model
+
+
+def create_quantization_config(bits: int = 4, compute_dtype: str = "bfloat16") -> BitsAndBytesConfig:
+    """Create a BitsAndBytes config for QLoRA."""
+    if bits != 4:
+        raise ValueError(f"Only 4-bit QLoRA is supported, received {bits}-bit.")
+
+    compute_dtype_map = {
+        "float16": torch.float16,
+        "fp16": torch.float16,
+        "bfloat16": torch.bfloat16,
+        "bf16": torch.bfloat16,
+        "float32": torch.float32,
+        "fp32": torch.float32,
+    }
+    torch_compute_dtype = compute_dtype_map.get(compute_dtype.lower())
+    if torch_compute_dtype is None:
+        raise ValueError(f"Unsupported quantization compute dtype: {compute_dtype}")
+
+    return BitsAndBytesConfig(
+        load_in_4bit=True,
+        bnb_4bit_quant_type="nf4",
+        bnb_4bit_use_double_quant=True,
+        bnb_4bit_compute_dtype=torch_compute_dtype,
+    )
 
 
 class PackingDataCollator(DataCollator):

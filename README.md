@@ -64,6 +64,45 @@ python pretrain.py \
   --wandb-project my-pretrain
 ```
 
+### Multi-GPU Pretraining With Accelerate
+
+```bash
+accelerate launch --num_processes 8 pretrain.py \
+  --output-dir ./checkpoints/10m_pretrain \
+  --hf-dataset openbmb/Ultra-FineWeb \
+  --hf-dataset-column content \
+  --hf-dataset-split en \
+  --epochs 1 \
+  --batch-size 64 \
+  --seq-len 2048 \
+  --gradient-checkpointing \
+  --use-flash-attention \
+  --mixed-precision bf16 \
+  --accumulation-steps 1 \
+  --num-workers 4
+```
+
+This uses `accelerate` for distributed pretraining and works for single-process, single-node multi-GPU, or larger launches configured through `accelerate config`.
+
+You can also auto-size the model directly from a target parameter count:
+
+```bash
+accelerate launch --num_processes 8 pretrain.py \
+  --output-dir ./checkpoints/1b_pretrain \
+  --hf-dataset openbmb/Ultra-FineWeb \
+  --hf-dataset-column content \
+  --hf-dataset-split en \
+  --target-parameters 1000000000 \
+  --scaling-method width+depth \
+  --seq-len 2048 \
+  --batch-size 16 \
+  --gradient-checkpointing \
+  --use-flash-attention \
+  --mixed-precision bf16 \
+  --accumulation-steps 2 \
+  --num-workers 4
+```
+
 ### Inference
 
 ```bash

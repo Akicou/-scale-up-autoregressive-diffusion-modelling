@@ -35,6 +35,7 @@ except ImportError:
     HAS_BNB = False
 
 from .base import BaseFinetuner, TrainerConfig
+from .utils import create_quantization_config, load_model_for_finetuning
 
 
 class InstructionDataset(Dataset):
@@ -52,18 +53,13 @@ class InstructionDataset(Dataset):
         self.template_format = template_format
         
         # Load data
-        if data_path and os.path.exists(data_path):
-            with open(data_path, "r", encoding="utf-8") as f:
-                if data_path.endswith(".json"):
-                    self.data = json.load(f)
-                else:
-                    self.data = [json.loads(line) for line in f]
-        else:
-            # Dummy data for testing
-            self.data = [
-                {"instruction": "Explain the concept of machine learning.", "output": "Machine learning is a subset of artificial intelligence that enables systems to learn and improve from experience without being explicitly programmed."},
-                {"instruction": "What is Python?", "output": "Python is a high-level, interpreted programming language known for its simplicity and readability."},
-            ]
+        if not data_path or not os.path.exists(data_path):
+            raise FileNotFoundError(f"SFT dataset not found: {data_path}")
+        with open(data_path, "r", encoding="utf-8") as f:
+            if data_path.endswith(".json"):
+                self.data = json.load(f)
+            else:
+                self.data = [json.loads(line) for line in f]
         
         # Ensure data is a list
         if isinstance(self.data, dict) and "data" in self.data:
@@ -155,22 +151,10 @@ class ToolCallingDataset(Dataset):
         self.max_seq_length = max_seq_length
         
         # Load data
-        if data_path and os.path.exists(data_path):
-            with open(data_path, "r", encoding="utf-8") as f:
-                self.data = json.load(f)
-        else:
-            # Dummy tool calling data
-            self.data = [
-                {
-                    "messages": [
-                        {"role": "user", "content": "What is 2 + 2?"},
-                        {"role": "assistant", "content": "Let me calculate that."},
-                        {"role": "tool_call", "name": "calculate", "args": {"expression": "2+2"}},
-                        {"role": "tool_result", "content": "4"},
-                        {"role": "assistant", "content": "The answer is 4."},
-                    ]
-                }
-            ]
+        if not data_path or not os.path.exists(data_path):
+            raise FileNotFoundError(f"Tool-calling dataset not found: {data_path}")
+        with open(data_path, "r", encoding="utf-8") as f:
+            self.data = json.load(f)
         
         # Ensure data is a list
         if isinstance(self.data, dict) and "data" in self.data:
@@ -251,11 +235,16 @@ class SFTTrainer(BaseFinetuner):
         """Setup model for SFT."""
         print(f"Loading model from {self.config.model_path}")
         
-        # Load model
-        model = AutoModelForCausalLM.from_pretrained(
+        model = load_model_for_finetuning(
             self.config.model_path,
+            device=self.config.device,
+            use_lora=False,
+            use_quantization=self.config.use_qlora,
+            quantization_config=create_quantization_config(
+                bits=self.config.quantization_bits,
+                compute_dtype=self.config.quantization_compute_dtype,
+            ) if self.config.use_qlora else None,
             torch_dtype=torch.bfloat16 if self.config.mixed_precision == "bf16" else torch.float32,
-            device_map=self.config.device,
             trust_remote_code=True,
         )
         
@@ -268,46 +257,49 @@ class SFTTrainer(BaseFinetuner):
     def setup_data(self) -> tuple:
         """Setup training and evaluation data."""
         # Create datasets
-        train_dataset = InstructionDataset(
-            data_path=self.config.train_data_path,
-            tokenizer=self.tokenizer,
-            max_seq_length=self.config.max_seq_length,
-        )
+        dataset_cls = ToolCallingDataset if getattr(self.config, "tool_calling", False) else InstructionDataset
+        dataset_kwargs = {
+            "data_path": self.config.train_data_path,
+            "tokenizer": self.tokenizer,
+            "max_seq_length": self.config.max_seq_length,
+        }
+        if dataset_cls is InstructionDataset:
+            dataset_kwargs["template_format"] = self.config.template_format
+        train_dataset = dataset_cls(**dataset_kwargs)
         
         eval_dataset = None
         if self.config.eval_data_path:
-            eval_dataset = InstructionDataset(
-                data_path=self.config.eval_data_path,
-                tokenizer=self.tokenizer,
-                max_seq_length=self.config.max_seq_length,
-            )
+            eval_kwargs = {
+                "data_path": self.config.eval_data_path,
+                "tokenizer": self.tokenizer,
+                "max_seq_length": self.config.max_seq_length,
+            }
+            if dataset_cls is InstructionDataset:
+                eval_kwargs["template_format"] = self.config.template_format
+            eval_dataset = dataset_cls(**eval_kwargs)
         else:
-            # Use a subset for eval
-            eval_dataset = InstructionDataset(
-                data_path=None,
-                tokenizer=self.tokenizer,
-                max_seq_length=self.config.max_seq_length,
-            )
+            eval_dataset = train_dataset
         
-        # Data collator
-        data_collator = DataCollatorForLanguageModeling(
-            tokenizer=self.tokenizer,
-            mlm=False,  # Causal LM
-        )
+        def collate_fn(batch):
+            return {
+                "input_ids": torch.stack([item["input_ids"] for item in batch]),
+                "attention_mask": torch.stack([item["attention_mask"] for item in batch]),
+                "labels": torch.stack([item["labels"] for item in batch]),
+            }
         
         # Create dataloaders
         train_loader = DataLoader(
             train_dataset,
             batch_size=self.config.batch_size,
             shuffle=True,
-            collate_fn=data_collator,
+            collate_fn=collate_fn,
         )
         
         eval_loader = DataLoader(
             eval_dataset,
             batch_size=self.config.batch_size,
             shuffle=False,
-            collate_fn=data_collator,
+            collate_fn=collate_fn,
         )
         
         return train_loader, eval_loader
@@ -389,6 +381,8 @@ def main():
         wandb_project=args.wandb_project,
         train_data_path=args.train_data_path,
         eval_data_path=args.eval_data_path,
+        tool_calling=args.tool_calling,
+        template_format=args.format,
     )
     
     # Create trainer

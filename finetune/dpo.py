@@ -29,6 +29,7 @@ from transformers import (
 from peft import LoraConfig, get_peft_model, TaskType, PeftModel
 
 from .base import BaseFinetuner, TrainerConfig
+from .utils import create_quantization_config, load_model_for_finetuning
 
 
 @dataclass
@@ -68,26 +69,13 @@ class PreferenceDataset(Dataset):
         self.rejected_key = rejected_key
         
         # Load data
-        if data_path and os.path.exists(data_path):
-            with open(data_path, "r", encoding="utf-8") as f:
-                if data_path.endswith(".json"):
-                    self.data = json.load(f)
-                else:
-                    self.data = [json.loads(line) for line in f]
-        else:
-            # Dummy preference data
-            self.data = [
-                {
-                    "prompt": "Explain what machine learning is.",
-                    "preferred": "Machine learning is a subset of artificial intelligence that enables systems to learn and improve from experience without being explicitly programmed. It uses algorithms to identify patterns in data and make decisions.",
-                    "rejected": "ML is when computers learn stuff.",
-                },
-                {
-                    "prompt": "What is Python?",
-                    "preferred": "Python is a high-level, interpreted programming language known for its simplicity, readability, and versatility. It supports multiple programming paradigms and has extensive libraries.",
-                    "rejected": "Python is a snake.",
-                },
-            ]
+        if not data_path or not os.path.exists(data_path):
+            raise FileNotFoundError(f"DPO dataset not found: {data_path}")
+        with open(data_path, "r", encoding="utf-8") as f:
+            if data_path.endswith(".json"):
+                self.data = json.load(f)
+            else:
+                self.data = [json.loads(line) for line in f]
         
         # Ensure data is a list
         if isinstance(self.data, dict) and "data" in self.data:
@@ -135,6 +123,7 @@ class PreferenceDataset(Dataset):
         
         return {
             "prompt": prompt,
+            "prompt_length": len(prompt_ids),
             "preferred": torch.tensor(preferred_full, dtype=torch.long),
             "rejected": torch.tensor(rejected_full, dtype=torch.long),
         }
@@ -163,18 +152,18 @@ class DPOTrainer(BaseFinetuner):
         """Setup model for DPO."""
         print(f"Loading model from {self.config.model_path}")
         
-        # Load policy model
-        model = AutoModelForCausalLM.from_pretrained(
+        model = load_model_for_finetuning(
             self.config.model_path,
+            device=self.config.device,
+            use_lora=False,
+            use_quantization=self.config.use_qlora,
+            quantization_config=create_quantization_config(
+                bits=self.config.quantization_bits,
+                compute_dtype=self.config.quantization_compute_dtype,
+            ) if self.config.use_qlora else None,
             torch_dtype=torch.bfloat16 if self.config.mixed_precision == "bf16" else torch.float32,
-            device_map=self.config.device,
             trust_remote_code=True,
         )
-        
-        # Freeze model for reference if reference-free
-        if self.config.reference_free:
-            for param in model.parameters():
-                param.requires_grad = False
         
         # Gradient checkpointing
         if self.config.use_gradient_checkpointing:
@@ -186,19 +175,23 @@ class DPOTrainer(BaseFinetuner):
         """Setup reference model for DPO."""
         if self.config.reference_model_path:
             print(f"Loading reference model from {self.config.reference_model_path}")
-            ref_model = AutoModelForCausalLM.from_pretrained(
+            ref_model = load_model_for_finetuning(
                 self.config.reference_model_path,
+                device=self.config.device,
+                use_lora=False,
+                use_quantization=False,
                 torch_dtype=torch.bfloat16 if self.config.mixed_precision == "bf16" else torch.float32,
-                device_map=self.config.device,
                 trust_remote_code=True,
             )
         else:
             # Clone from policy model
             print("Cloning policy model as reference")
-            ref_model = AutoModelForCausalLM.from_pretrained(
+            ref_model = load_model_for_finetuning(
                 self.config.model_path,
+                device=self.config.device,
+                use_lora=False,
+                use_quantization=False,
                 torch_dtype=torch.bfloat16 if self.config.mixed_precision == "bf16" else torch.float32,
-                device_map=self.config.device,
                 trust_remote_code=True,
             )
         
@@ -229,15 +222,11 @@ class DPOTrainer(BaseFinetuner):
                 rejected_key=self.config.rejected_response,
             )
         else:
-            # Use subset for eval
-            eval_dataset = PreferenceDataset(
-                data_path=None,
-                tokenizer=self.tokenizer,
-                max_seq_length=self.config.max_seq_length,
-            )
+            eval_dataset = train_dataset
         
         def collate_fn(batch):
             return {
+                "prompt_length": torch.tensor([x["prompt_length"] for x in batch], dtype=torch.long),
                 "preferred": torch.stack([x["preferred"] for x in batch]),
                 "rejected": torch.stack([x["rejected"] for x in batch]),
             }
@@ -262,6 +251,7 @@ class DPOTrainer(BaseFinetuner):
         self,
         model: PreTrainedModel,
         input_ids: torch.Tensor,
+        prompt_lengths: torch.Tensor,
     ) -> torch.Tensor:
         """
         Compute log probabilities for each token.
@@ -288,6 +278,12 @@ class DPOTrainer(BaseFinetuner):
             dim=-1,
             index=input_ids_shifted.unsqueeze(-1),
         ).squeeze(-1)  # [batch, seq_len - 1]
+
+        positions = torch.arange(token_log_probs.shape[1], device=input_ids.device).unsqueeze(0)
+        response_mask = positions >= (prompt_lengths.unsqueeze(1) - 1)
+        if self.tokenizer.pad_token_id is not None:
+            response_mask = response_mask & (input_ids_shifted != self.tokenizer.pad_token_id)
+        token_log_probs = token_log_probs * response_mask
         
         return token_log_probs
     
@@ -344,12 +340,13 @@ class DPOTrainer(BaseFinetuner):
     
     def training_step(self, batch: Dict[str, torch.Tensor]) -> Dict[str, float]:
         """Execute a single training step."""
+        prompt_lengths = batch["prompt_length"].to(self.model.device)
         preferred = batch["preferred"].to(self.model.device)
         rejected = batch["rejected"].to(self.model.device)
         
         # Get policy log probs
-        policy_logprobs_preferred = self.get_logprobs(self.model, preferred)
-        policy_logprobs_rejected = self.get_logprobs(self.model, rejected)
+        policy_logprobs_preferred = self.get_logprobs(self.model, preferred, prompt_lengths)
+        policy_logprobs_rejected = self.get_logprobs(self.model, rejected, prompt_lengths)
         
         # Get reference log probs
         if self.config.reference_free:
@@ -359,8 +356,8 @@ class DPOTrainer(BaseFinetuner):
         else:
             # Use reference model
             with torch.no_grad():
-                ref_logprobs_preferred = self.get_logprobs(self.reference_model, preferred)
-                ref_logprobs_rejected = self.get_logprobs(self.reference_model, rejected)
+                ref_logprobs_preferred = self.get_logprobs(self.reference_model, preferred, prompt_lengths)
+                ref_logprobs_rejected = self.get_logprobs(self.reference_model, rejected, prompt_lengths)
         
         # Compute loss
         loss = self.compute_dpo_loss(
@@ -384,19 +381,20 @@ class DPOTrainer(BaseFinetuner):
     def evaluation_step(self, batch: Dict[str, torch.Tensor]) -> Dict[str, float]:
         """Execute a single evaluation step."""
         # Similar to training but without gradient
+        prompt_lengths = batch["prompt_length"].to(self.model.device)
         preferred = batch["preferred"].to(self.model.device)
         rejected = batch["rejected"].to(self.model.device)
         
         with torch.no_grad():
-            policy_logprobs_preferred = self.get_logprobs(self.model, preferred)
-            policy_logprobs_rejected = self.get_logprobs(self.model, rejected)
+            policy_logprobs_preferred = self.get_logprobs(self.model, preferred, prompt_lengths)
+            policy_logprobs_rejected = self.get_logprobs(self.model, rejected, prompt_lengths)
             
             if self.config.reference_free:
                 ref_logprobs_preferred = policy_logprobs_preferred
                 ref_logprobs_rejected = policy_logprobs_rejected
             else:
-                ref_logprobs_preferred = self.get_logprobs(self.reference_model, preferred)
-                ref_logprobs_rejected = self.get_logprobs(self.reference_model, rejected)
+                ref_logprobs_preferred = self.get_logprobs(self.reference_model, preferred, prompt_lengths)
+                ref_logprobs_rejected = self.get_logprobs(self.reference_model, rejected, prompt_lengths)
             
             loss = self.compute_dpo_loss(
                 policy_logprobs_preferred,

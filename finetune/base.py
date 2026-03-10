@@ -30,6 +30,7 @@ from peft import (
     TaskType,
 )
 import accelerate
+from pretrain import get_default_tokenizer
 
 # Try to import wandb
 try:
@@ -87,6 +88,8 @@ class TrainerConfig:
     # Data
     train_data_path: Optional[str] = None
     eval_data_path: Optional[str] = None
+    tool_calling: bool = False
+    template_format: str = "chat"
 
 
 class BaseFinetuner(ABC):
@@ -141,9 +144,12 @@ class BaseFinetuner(ABC):
         tokenizer_path = self.config.tokenizer_path or self.config.model_path
         
         if os.path.exists(tokenizer_path):
-            tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
+            try:
+                tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
+            except Exception:
+                tokenizer = get_default_tokenizer()
         else:
-            raise FileNotFoundError(f"Tokenizer not found at {tokenizer_path}")
+            tokenizer = get_default_tokenizer()
         
         # Ensure padding token is set
         if tokenizer.pad_token is None:
@@ -171,6 +177,9 @@ class BaseFinetuner(ABC):
     
     def setup_training(self):
         """Setup training infrastructure."""
+        if self.config.use_qlora and not self.config.use_lora:
+            raise ValueError("QLoRA requires LoRA adapters. Pass --use-lora together with --use-qlora.")
+
         # Setup tokenizer
         self.setup_tokenizer()
         
@@ -195,29 +204,30 @@ class BaseFinetuner(ABC):
         self.accelerator = accelerate.Accelerator(
             gradient_accumulation_steps=self.config.gradient_accumulation_steps,
             mixed_precision=self.config.mixed_precision,
-            log_interval=self.config.log_interval,
         )
         
         # Prepare with accelerator
-        self.model, self.optimizer, self.train_loader = self.accelerator.prepare(
-            self.model, self.optimizer, self.train_loader
-        )
+        if self.eval_loader is not None:
+            prepared = self.accelerator.prepare(
+                self.model, self.optimizer, self.train_loader, self.eval_loader
+            )
+            self.model, self.optimizer, self.train_loader, self.eval_loader = prepared
+        else:
+            self.model, self.optimizer, self.train_loader = self.accelerator.prepare(
+                self.model, self.optimizer, self.train_loader
+            )
         
         # Initialize wandb
         if self.config.wandb_project and HAS_WANDB:
             wandb.init(project=self.config.wandb_project, config=vars(self.config))
-            self.model.accelerator = self.accelerator
     
     def save_checkpoint(self, step: int, metrics: Dict[str, float]):
         """Save model checkpoint."""
         output_dir = Path(self.config.output_dir) / f"checkpoint-{step}"
         output_dir.mkdir(parents=True, exist_ok=True)
+        model_to_save = self.accelerator.unwrap_model(self.model) if self.accelerator else self.model
         
-        # Save adapter config for LoRA
-        if self.config.use_lora:
-            self.model.save_pretrained(output_dir)
-        else:
-            self.model.save_pretrained(output_dir)
+        model_to_save.save_pretrained(output_dir)
         
         # Save tokenizer
         if self.tokenizer:

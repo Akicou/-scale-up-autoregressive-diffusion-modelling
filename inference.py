@@ -7,6 +7,7 @@ import math
 import torch
 from typing import Dict, Any, List, Optional
 import json
+from pathlib import Path
 
 from pretrain import DualModeModel, get_default_tokenizer
 from tools import ToolRegistry, ToolCallParser, detect_tool_calls, parse_tool_result
@@ -17,6 +18,7 @@ tokenizer = None
 device = None
 tool_registry = None
 tool_parser = None
+MASK_TOKEN_ID = 0
 
 
 def init_tools():
@@ -30,6 +32,8 @@ def init_tools():
 def load_model(checkpoint_path: str, config_path: str, device_str: str = None):
     global model, tokenizer, device
     
+    checkpoint_path = Path(checkpoint_path)
+    config_path = Path(config_path)
     config = torch.load(config_path, map_location="cpu")
     
     if device_str is None:
@@ -45,6 +49,7 @@ def load_model(checkpoint_path: str, config_path: str, device_str: str = None):
         head_dim=config.get("head_dim", 64),
         max_seq_len=config.get("max_seq_len", 8192),
         use_flash_attn=False,
+        diffusion_mask_prob=config.get("diffusion_mask_prob", 0.15),
     )
     
     state_dict = torch.load(checkpoint_path, map_location=device)
@@ -52,23 +57,43 @@ def load_model(checkpoint_path: str, config_path: str, device_str: str = None):
     model = model.to(device)
     model.eval()
     
-    tokenizer = get_default_tokenizer()
-    
-    # Add special tokens for reasoning
-    special_tokens = ["<thinking>", "</thinking>", "<reasoning>", "</reasoning>", "<output>", "</output>"]
-    num_added = tokenizer.add_tokens(special_tokens)
-    if num_added > 0:
-        print(f"Added {num_added} special tokens: {special_tokens}")
-        # Resize model embeddings to accommodate new tokens
-        model.token_embeddings = torch.nn.Embedding(len(tokenizer), model.hidden_size).to(device)
-        # Initialize new embeddings
-        with torch.no_grad():
-            torch.nn.init.normal_(model.token_embeddings.weight, mean=0.0, std=0.02)
-        print(f"Resized token embeddings to {len(tokenizer)} tokens")
+    tokenizer_dir = config_path.parent
+    try:
+        from transformers import AutoTokenizer
+
+        tokenizer = AutoTokenizer.from_pretrained(tokenizer_dir)
+        if tokenizer.pad_token is None:
+            tokenizer.pad_token = tokenizer.eos_token
+        print(f"Loaded tokenizer from {tokenizer_dir}")
+    except Exception:
+        tokenizer = get_default_tokenizer()
+        print("Tokenizer files not found next to the checkpoint, using the default tokenizer fallback.")
     
     print(f"Model loaded: {sum(p.numel() for p in model.parameters())/1e6:.1f}M params")
     
     return model, tokenizer
+
+
+def apply_top_p_filter(logits: torch.Tensor, top_p: float) -> torch.Tensor:
+    """Apply nucleus filtering to logits."""
+    if top_p >= 1.0:
+        return logits
+    sorted_logits, sorted_indices = torch.sort(logits, descending=True)
+    cumulative_probs = torch.cumsum(torch.softmax(sorted_logits, dim=-1), dim=-1)
+    sorted_indices_to_remove = cumulative_probs > top_p
+    sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
+    sorted_indices_to_remove[..., 0] = 0
+    filtered_logits = logits.clone()
+    filtered_logits[sorted_indices[sorted_indices_to_remove]] = float("-inf")
+    return filtered_logits
+
+
+def sample_next_token(next_token_logits: torch.Tensor, temperature: float, top_p: float) -> torch.Tensor:
+    """Sample a token id from logits."""
+    scaled_logits = next_token_logits / max(temperature, 1e-5)
+    filtered_logits = apply_top_p_filter(scaled_logits, top_p)
+    probs = torch.softmax(filtered_logits, dim=-1)
+    return torch.multinomial(probs, num_samples=1)
 
 
 def complete_ar(input_ids: torch.Tensor, max_tokens: int, temperature: float, top_p: float, verbose: bool) -> tuple:
@@ -84,18 +109,7 @@ def complete_ar(input_ids: torch.Tensor, max_tokens: int, temperature: float, to
             outputs = model(input_ids, use_cache=False, mode="ar")
             logits = outputs["ar_logits"]
             
-            next_token_logits = logits[0, -1, :] / temperature
-            if top_p < 1.0:
-                sorted_logits, sorted_indices = torch.sort(next_token_logits, descending=True)
-                cumulative_probs = torch.cumsum(torch.softmax(sorted_logits, dim=-1), dim=-1)
-                sorted_indices_to_remove = cumulative_probs > top_p
-                sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
-                sorted_indices_to_remove[..., 0] = 0
-                indices_to_remove = sorted_indices[sorted_indices_to_remove]
-                next_token_logits[indices_to_remove] = float('-inf')
-            
-            probs = torch.softmax(next_token_logits, dim=-1)
-            next_token = torch.multinomial(probs, num_samples=1)
+            next_token = sample_next_token(logits[0, -1, :], temperature, top_p)
             
             if first_token_time is None:
                 first_token_time = time.time() - start_time
@@ -112,6 +126,47 @@ def complete_ar(input_ids: torch.Tensor, max_tokens: int, temperature: float, to
                 token_text = tokenizer.decode([next_token.item()], skip_special_tokens=True)
                 print(f"[ar] {len(generated_ids)}: {token_text!r}")
     
+    return generated_ids, first_token_time if first_token_time else time.time() - start_time
+
+
+def complete_combined(input_ids: torch.Tensor, max_tokens: int, temperature: float, top_p: float, verbose: bool) -> tuple:
+    """Generate tokens by blending AR next-token logits with diffusion logits on a masked next position."""
+    generated_ids = []
+    start_time = time.time()
+    first_token_time = None
+    input_length = input_ids.shape[1]
+    max_length = min(input_length + max_tokens, model.max_seq_len)
+
+    with torch.no_grad():
+        for _ in range(max_length - input_length):
+            ar_outputs = model(input_ids, use_cache=False, mode="ar")
+            ar_logits = ar_outputs["ar_logits"][0, -1, :]
+
+            masked_input = torch.cat(
+                [input_ids, torch.full((input_ids.shape[0], 1), MASK_TOKEN_ID, dtype=input_ids.dtype, device=input_ids.device)],
+                dim=1,
+            )
+            diffusion_outputs = model(masked_input, use_cache=False, mode="diffusion")
+            diffusion_logits = diffusion_outputs["diffusion_logits"][0, -1, :]
+
+            combined_logits = 0.5 * (ar_logits + diffusion_logits)
+            next_token = sample_next_token(combined_logits, temperature, top_p)
+
+            if first_token_time is None:
+                first_token_time = time.time() - start_time
+                if verbose:
+                    print(f"[combined] First token at {first_token_time:.3f}s")
+
+            if next_token.item() == tokenizer.eos_token_id:
+                break
+
+            generated_ids.append(next_token.item())
+            input_ids = torch.cat([input_ids, next_token.unsqueeze(0)], dim=1)
+
+            if verbose:
+                token_text = tokenizer.decode([next_token.item()], skip_special_tokens=True)
+                print(f"[combined] {len(generated_ids)}: {token_text!r}")
+
     return generated_ids, first_token_time if first_token_time else time.time() - start_time
 
 
@@ -132,7 +187,7 @@ def complete_diffusion(input_ids: torch.Tensor, max_tokens: int, num_steps: int 
     device = input_ids.device
     
     # Create fixed-size sequence with prompt + [MASK] for generation space
-    mask_token_id = tokenizer.pad_token_id if tokenizer.pad_token_id else 0
+    mask_token_id = MASK_TOKEN_ID
     generation_seq = torch.full((batch_size, input_length + max_tokens), mask_token_id, dtype=torch.long, device=device)
     generation_seq[:, :input_length] = input_ids
     
@@ -212,6 +267,44 @@ def complete_diffusion(input_ids: torch.Tensor, max_tokens: int, num_steps: int 
     return generated_ids, first_token_time
 
 
+def complete_reasoning(input_ids: torch.Tensor, max_tokens: int, temperature: float, top_p: float, verbose: bool) -> tuple:
+    """Generate an explicit thinking phase with AR, then answer from the resulting context with diffusion."""
+    thinking_open_ids = tokenizer.encode("<thinking>\n", add_special_tokens=False)
+    thinking_close_ids = tokenizer.encode("</thinking>\n", add_special_tokens=False)
+    output_open_ids = tokenizer.encode("<output>\n", add_special_tokens=False)
+
+    context_ids = input_ids.clone()
+    prompt_text = tokenizer.decode(context_ids[0], skip_special_tokens=False)
+    if "<thinking>" not in prompt_text:
+        context_ids = torch.cat(
+            [context_ids, torch.tensor([thinking_open_ids], dtype=context_ids.dtype, device=context_ids.device)],
+            dim=1,
+        )
+
+    thinking_budget = max(1, max_tokens // 2)
+    thinking_ids, first_token_time = complete_ar(context_ids, thinking_budget, temperature, top_p, verbose)
+    generated_thinking = thinking_ids[:]
+
+    close_seq = thinking_close_ids
+    if close_seq and generated_thinking[-len(close_seq):] != close_seq:
+        generated_thinking.extend(close_seq)
+
+    reasoning_context = torch.cat(
+        [context_ids, torch.tensor([generated_thinking + output_open_ids], dtype=context_ids.dtype, device=context_ids.device)],
+        dim=1,
+    )
+    remaining_budget = max(1, max_tokens - len(generated_thinking))
+    answer_ids, _ = complete_diffusion(
+        reasoning_context,
+        remaining_budget,
+        num_steps=min(10, max(4, remaining_budget)),
+        temperature=temperature,
+        verbose=verbose,
+    )
+
+    return generated_thinking + output_open_ids + answer_ids, first_token_time
+
+
 def complete(prompt: str, max_tokens: int = 100, temperature: float = 1.0, top_p: float = 1.0, mode: str = "ar", verbose: bool = True) -> Dict[str, Any]:
     global model, tokenizer, device
     if model is None or tokenizer is None:
@@ -235,13 +328,11 @@ def complete(prompt: str, max_tokens: int = 100, temperature: float = 1.0, top_p
             input_ids, max_tokens, num_steps=10, temperature=temperature, verbose=verbose
         )
     elif mode == "combined":
-        # Use AR for now - combined mode would need special implementation
-        generated_ids, first_token_time = complete_ar(
+        generated_ids, first_token_time = complete_combined(
             input_ids, max_tokens, temperature, top_p, verbose
         )
     elif mode == "reasoning":
-        # Use AR for thinking phase
-        generated_ids, first_token_time = complete_ar(
+        generated_ids, first_token_time = complete_reasoning(
             input_ids, max_tokens, temperature, top_p, verbose
         )
     else:
